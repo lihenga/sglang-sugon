@@ -53,6 +53,68 @@ def _storage_suffix(
     return "_".join(parts)
 
 
+def _shared_pool_suffix(
+    *,
+    tp_shared: bool,
+    tp_rank: int,
+    attn_cp_rank: int,
+    pp_rank: int,
+    dcp_sharded: bool,
+    dcp_size: int,
+    dcp_rank: int,
+) -> str:
+    """Key suffix for a pool whose pages are byte-identical across attention TP.
+    The versioned shared term keeps it from aliasing an older per-rank object."""
+    parts = ["tpshared_v1" if tp_shared else f"tp{tp_rank}"]
+    if dcp_sharded:
+        parts.append(f"dcp{dcp_size}r{dcp_rank}")
+    parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
+    return "_".join(parts)
+
+
+def _storage_sharing(
+    pools,
+    *,
+    rank_replicated: bool,
+    tp_rank: int,
+    tp_size: int,
+    attn_cp_rank: int,
+    pp_rank: int,
+    offload_owner: bool,
+    dcp_size: int,
+    dcp_rank: int,
+):
+    """Per-pool key suffixes and the pools this rank offloads. A pool replicated
+    across attention TP is written by TP rank 0 (or the first DCP block) only."""
+    dcp_sharded = {name for name, pool in pools.items() if pool.dcp_sharded}
+    tp_shared = {
+        name
+        for name, pool in pools.items()
+        if not rank_replicated and tp_size > 1 and pool.tp_replicated
+    }
+    suffixes = {
+        name: _shared_pool_suffix(
+            tp_shared=name in tp_shared,
+            tp_rank=tp_rank,
+            attn_cp_rank=attn_cp_rank,
+            pp_rank=pp_rank,
+            dcp_sharded=name in dcp_sharded,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+        )
+        for name in tp_shared | dcp_sharded
+    }
+    offload_pools = {
+        name
+        for name in pools
+        if offload_owner
+        and (
+            name not in tp_shared or tp_rank < (dcp_size if name in dcp_sharded else 1)
+        )
+    }
+    return suffixes, offload_pools, tp_shared
+
+
 class MooncakeDirectLinker(UnifiedCacheLinker):
     def __init__(
         self,
@@ -105,8 +167,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             "on",
         )
 
+        parallel = get_parallel()
         tp_rank = 0
-        tp_size = get_parallel().tp_size
+        tp_size = parallel.tp_size
         tp_group = params.attn_tp_cache_group or params.tp_cache_group
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             tp_rank = torch.distributed.get_rank(group=tp_group)
@@ -179,42 +242,29 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
-        self.shared_mla_kv = (
-            os.environ.get("SGLANG_MOONCAKE_SHARE_HYBRID_MLA_KV", "0") == "1"
+        pool_suffixes, self.offload_pools, tp_shared = _storage_sharing(
+            self.pools,
+            rank_replicated=rank_replicated,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            attn_cp_rank=params.attn_cp_rank,
+            pp_rank=params.pp_rank,
+            offload_owner=self.offload_owner,
+            dcp_size=parallel.attn_dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
         )
-        self.kv_offload_owner = tp_rank == 0
-        if self.shared_mla_kv:
-            from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-
-            if (
-                PoolName.MAMBA not in self.pools
-                or type(self.pools[PoolName.KV].device_pool) is not MLATokenToKVPool
-                or params.attn_cp_size != 1
-            ):
-                raise ValueError(
-                    "Shared hybrid MLA KV requires plain MLA + Mamba without CP."
-                )
-            # MLA KV is replicated; Mamba and draft states retain their TP suffixes.
-            self.storage.direct_pool_suffixes = {
-                PoolName.KV: _storage_suffix(
-                    rank_replicated=True,
-                    tp_rank=tp_rank,
-                    attn_cp_rank=params.attn_cp_rank,
-                    pp_rank=params.pp_rank,
-                )
-            }
-            self.storage.config_prefix = (
-                f"{self.storage.config_prefix}_hybrid_mla_shared_kv_v1"
-            )
-            logger.info("Shared hybrid MLA KV writes: owner=%s", self.kv_offload_owner)
+        self.storage.direct_pool_suffixes = pool_suffixes
         logger.info(
             "Mooncake direct linker storage topology: "
-            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
+            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s, "
+            "tp_shared=%s, offload_pools=%s",
             rank_replicated,
             tp_rank,
             tp_size,
             self.offload_owner,
             storage_suffix,
+            sorted(tp_shared),
+            sorted(self.offload_pools),
         )
 
         self.register_buffers()
@@ -224,7 +274,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.broadcast_loads = {}
         if (
             server_args.enable_linker_mla_dedup
-            and (rank_replicated or self.shared_mla_kv)
+            and parallel.attn_dcp_size == 1
+            and (rank_replicated or PoolName.KV in tp_shared)
             and tp_size > 1
         ):
             broadcast_pools = self.pool_group
@@ -616,15 +667,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
-        if getattr(self, "shared_mla_kv", False) and not self.kv_offload_owner:
-            expanded = [
-                transfer for transfer in expanded if transfer.name != PoolName.KV
-            ]
-            # Queue empty writes too, preserving FIFO acknowledgements and slot lifetime.
         self.freeze_gc_once()
         if not self.offload_owner:
             self.offload_results.put(True)
             return True
+        expanded = [t for t in expanded if t.name in self.offload_pools]
+        # Even a filtered-out write queues behind earlier writes so its
+        # acknowledgement cannot release the wrong node's GPU slots.
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
         ready_events = self.record_offload_ready()

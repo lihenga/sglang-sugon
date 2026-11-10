@@ -74,18 +74,18 @@ successfully does not make these capabilities available.
 
 ## Hybrid MLA replication and DFS sizing
 
-`SGLANG_MOONCAKE_SHARE_HYBRID_MLA_KV=1` stores the replicated FULL MLA KV
-once per attention TP group, while retaining separate Mamba and draft objects
-for each rank. It requires a plain MLA + Mamba pool without CP/DCP. The
-storage namespace receives a layout marker, so these objects do not collide
-with the original per-rank layout. This option is off by default.
+The direct linker automatically shares replicated FULL MLA KV, DSA index-K
+and MLA draft objects across attention TP. KDA/Mamba state and MHA draft KV
+keep per-rank keys. DCP-sharded pools use one writer per DCP shard, while pools
+replicated across DCP use one writer per attention TP group. The
+`SGLANG_MOONCAKE_SHARE_HYBRID_MLA_KV` environment variable can be removed from
+launch scripts. The shared object keys use the new `tpshared_v1` format.
 
-With that option, `--enable-linker-mla-dedup` also reads the replicated KV only
-on rank zero and broadcasts each ready layer over the existing NCCL group.
-Each rank still loads its own side states; their native completion counters
-gate the same forward. Cross-rank load-plan agreement and collective failure
-handling are preserved. This trades extra GPU communication for fewer DFS and
-host-to-device reads; measure both cold requests and cached-prefix requests.
+At DCP size 1, `--enable-linker-mla-dedup` optionally loads the shared FULL KV
+on rank zero and broadcasts each ready layer over NCCL. At DCP size greater
+than 1, each rank restores the keys for its own KV shard and the flag can be
+omitted. Mooncake's batched writes still combine transfers for the pools owned
+by each writer.
 
 An explicit positive `dfs_replica_num` now checks that
 `MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES` can hold the largest physical page/state

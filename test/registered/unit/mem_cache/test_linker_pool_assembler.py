@@ -734,6 +734,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
     def test_mla_mamba_maps_kv_pages_and_state_slots(self):
         from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
         from sglang.srt.mem_cache.memory_pool import (
+            DSATokenToKVPool,
             HybridLinearKVPool,
             MHATokenToKVPool,
             MLATokenToKVPool,
@@ -743,6 +744,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         kvcache.start_layer = 0
         kvcache.full_attention_layer_id_mapping = {1: 0, 3: 1}
         kvcache.full_kv_pool = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        kvcache.full_kv_pool.page_size = 2
         kvcache.full_kv_pool.kv_buffer = [
             torch.zeros((8, 1, 5), dtype=torch.uint8) for _ in range(2)
         ]
@@ -777,7 +779,9 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 patch.object(
                     linker_pool_assembler,
                     "get_parallel",
-                    return_value=SimpleNamespace(attn_dcp_size=dcp_size),
+                    return_value=SimpleNamespace(
+                        attn_dcp_size=dcp_size, attn_dcp_rank=dcp_size - 1
+                    ),
                 ),
             ):
                 return resolve_hybrid_device_pool_group(
@@ -797,9 +801,69 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(mamba.prepare_locations(torch.tensor([3])), [3])
         self.assertEqual(group.sources[PoolName.DRAFT], PoolName.KV)
         self.assertEqual(group.entry_map[PoolName.DRAFT].layer_mapping, {0: (0, 1)})
+        self.assertNotIn(PoolName.INDEXER, group.entry_map)
 
-        with self.assertRaisesRegex(ValueError, "plain MLA"):
-            resolve(dcp_size=2)
+        mla = kvcache.full_kv_pool
+        dsa = DSATokenToKVPool.__new__(DSATokenToKVPool)
+        dsa.page_size = 2
+        dsa.kv_buffer = mla.kv_buffer
+        dsa.index_key_cache = SimpleNamespace(
+            buffer=[
+                torch.zeros((0, 3), dtype=torch.uint8),
+                torch.zeros((4, 3), dtype=torch.uint8),
+            ]
+        )
+        kvcache.full_kv_pool = dsa
+        group = resolve()
+        indexer = group.entry_map[PoolName.INDEXER]
+        self.assertEqual(group.sources[PoolName.INDEXER], PoolName.KV)
+        self.assertEqual(indexer.layer_mapping, {3: 0})
+        self.assertEqual(indexer.prepare_locations(torch.tensor([2, 3])), [1])
+        self.assertEqual(
+            {name: entry.tp_replicated for name, entry in group.entry_map.items()},
+            {
+                PoolName.KV: True,
+                PoolName.INDEXER: True,
+                PoolName.MAMBA: False,
+                PoolName.DRAFT: False,
+            },
+        )
+        dsa.page_size = 1
+        indexer_buffer = torch.arange(24, dtype=torch.uint8).view(8, 3)
+        dsa.index_key_cache.buffer[1] = indexer_buffer
+        group = resolve(dcp_size=2)
+        slots = torch.tensor([4, 5])
+        kv = group.entry_map[PoolName.KV]
+        self.assertTrue(kv.dcp_sharded)
+        self.assertEqual(kv.translate_indices(slots).tolist(), [2])
+        indexer = group.entry_map[PoolName.INDEXER]
+        self.assertFalse(indexer.dcp_sharded)
+        self.assertEqual(
+            indexer.get_page_buffer_meta(indexer.translate_indices(slots)),
+            ([indexer_buffer[4].data_ptr()], [6]),
+        )
+        kvcache.full_kv_pool = mla
+
+        mla_draft = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        mla_draft.page_size, mla_draft.layer_num = 2, 2
+        mla_draft.kv_buffer = [
+            torch.zeros((8, 1, 5), dtype=torch.uint8) for _ in range(2)
+        ]
+        params.sidecar_draft_device_pools = (mla_draft,)
+        draft_entry = resolve().entry_map[PoolName.DRAFT]
+        self.assertEqual(draft_entry.layer_mapping, {0: 0, 1: 1})
+        self.assertEqual(draft_entry.prepare_locations(torch.tensor([2, 3])), [2])
+        mla.page_size = 1
+        draft_entry = resolve(dcp_size=2).entry_map[PoolName.DRAFT]
+        self.assertFalse(draft_entry.dcp_sharded)
+        self.assertEqual(draft_entry.translate_indices(slots).tolist(), [4, 5])
+        mla_draft.page_size = 1
+        draft_entry = resolve(dcp_size=2).entry_map[PoolName.DRAFT]
+        self.assertTrue(draft_entry.dcp_sharded)
+        self.assertEqual(draft_entry.translate_indices(slots).tolist(), [2])
+        mla.page_size = 2
+        params.sidecar_draft_device_pools = (draft,)
+
         params.mtp_draft_device_pools = (object(),)
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve()
