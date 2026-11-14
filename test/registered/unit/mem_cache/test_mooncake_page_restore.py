@@ -1,4 +1,6 @@
 import ctypes
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -6,6 +8,7 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
+    _build_plain_device_pool_group,
 )
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
@@ -132,3 +135,34 @@ def test_replica_policy_survives_group_and_session_attribution():
     assert config.replica_num == 0 and config.dfs_replica_num == 1
     assert config.group_ids == ["group"]
     assert config.session_ids == ["session"]
+
+
+@pytest.mark.parametrize("mla", [False, True])
+def test_plain_pool_builder_preserves_key_value_layout_and_replication(mla):
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+
+    pool = (MLATokenToKVPool if mla else MHATokenToKVPool).__new__(
+        MLATokenToKVPool if mla else MHATokenToKVPool
+    )
+    pool.dtype = torch.bfloat16
+    pool.layer_num = 2
+    if mla:
+        pool.kv_buffer = [torch.zeros((8, 4), dtype=pool.dtype) for _ in range(2)]
+    else:
+        pool.k_buffer = [torch.zeros((8, 4), dtype=pool.dtype) for _ in range(2)]
+        pool.v_buffer = [torch.zeros((8, 4), dtype=pool.dtype) for _ in range(2)]
+        pool.k_scale_buffer = pool.native_k_scale_buffer = None
+    params = SimpleNamespace(attn_cp_size=1, mtp_draft_device_pools=())
+    with patch(
+        "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler.get_parallel",
+        return_value=SimpleNamespace(attn_dcp_size=1),
+    ):
+        group = _build_plain_device_pool_group(pool, params, 2)
+        assert group.rank_replicated is mla
+        ptrs, sizes, offsets = group.entries[0].get_prepared_page_range_meta([0, 4])
+        assert len(ptrs) == 2
+        assert sum(sizes[0]) == (32 if mla else 64)
+        assert offsets[0][0] == 0
+        params.attn_cp_size = 2
+        with pytest.raises(ValueError, match="without CP"):
+            _build_plain_device_pool_group(pool, params, 2)
