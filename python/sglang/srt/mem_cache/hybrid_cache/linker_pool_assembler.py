@@ -553,6 +553,37 @@ def _mamba_device_pool_entry(
     )
 
 
+def _build_plain_device_pool_group(kvcache: Any, params: Any, page_size: int):
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+
+    if (
+        type(kvcache) not in (MHATokenToKVPool, MLATokenToKVPool)
+        or kvcache.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or get_parallel().attn_dcp_size > 1
+        or params.attn_cp_size > 1
+        or params.mtp_draft_device_pools
+    ):
+        raise ValueError(
+            "Plain direct linking requires an unscaled MHA/MLA pool without CP or packed draft pools."
+        )
+    mapping = {layer: layer for layer in range(kvcache.layer_num)}
+    mla = type(kvcache) is MLATokenToKVPool
+    entry = (
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=kvcache,
+            components=[kvcache.kv_buffer],
+            layer_mapping=mapping,
+            page_size=page_size,
+            rows_are_pages=False,
+        )
+        if mla
+        else _mha_device_pool_entry(PoolName.KV, kvcache, mapping, page_size)
+    )
+    return DevicePoolGroup([entry], kvcache.layer_num, page_size, rank_replicated=mla)
+
+
 def _build_mamba_swa_device_pool_group(
     kvcache: Any, params: Any, page_size: int
 ) -> DevicePoolGroup:
