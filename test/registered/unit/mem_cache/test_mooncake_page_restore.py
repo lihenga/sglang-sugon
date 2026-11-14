@@ -1,4 +1,5 @@
 import ctypes
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -111,6 +112,40 @@ def test_local_buffer_config_is_resolved_for_each_client(monkeypatch):
         monkeypatch.setenv("SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE", value)
         with pytest.raises(ValueError):
             _local_buffer_size()
+
+
+def test_native_counter_binding_wakes_waiter_without_publishing_early():
+    ready = threading.Event()
+    finished = threading.Event()
+
+    class Plan:
+        def wait(self, layer):
+            assert ready.wait(5)
+
+    counter = LayerWiseLoadCounter(1)
+    index = counter.update_producer()
+    counter.set_consumer(index)
+    waiter = threading.Thread(target=lambda: (counter.wait_until(0), finished.set()))
+    waiter.start()
+    counter.bind(index, Plan())
+    assert not finished.wait(0.05)
+    ready.set()
+    waiter.join(5)
+    assert finished.is_set()
+    assert counter.finish(index)
+
+
+def test_native_counter_failure_is_reported_at_finish():
+    class Plan:
+        def wait(self, layer):
+            raise OSError("DFS read failed")
+
+    counter = LayerWiseLoadCounter(2)
+    index = counter.update_producer()
+    counter.set_consumer(index)
+    counter.bind(index, Plan())
+    counter.wait_until(0)
+    assert not counter.finish(index)
 
 
 def test_replica_policy_survives_group_and_session_attribution():

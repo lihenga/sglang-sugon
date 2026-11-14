@@ -84,6 +84,7 @@ class LayerWiseLoadCounter:
         self.producer_index = -1
         self.consumer_index = -1
         self.futures: dict[int, list[Future]] = {}
+        self.native_plans = {}
 
     def update_producer(self) -> int:
         self.producer_index += 1
@@ -95,6 +96,12 @@ class LayerWiseLoadCounter:
 
     def complete(self, index: int, layer: int) -> None:
         self.futures[index][layer].set_result(None)
+
+    def bind(self, index: int, plan) -> None:
+        """Wake an already-waiting forward and delegate readiness to native I/O."""
+        self.native_plans[index] = plan
+        for future in self.futures[index]:
+            future.set_result(None)
 
     def fail(self, index: int, error: BaseException) -> None:
         for future in self.futures.get(index, ()):
@@ -108,6 +115,13 @@ class LayerWiseLoadCounter:
             return
         # Blocks until the layer resolves; a failure is reported by finish().
         futures[threshold].exception()
+        plan = self.native_plans.get(index)
+        if plan is not None:
+            try:
+                plan.wait(threshold)
+            except Exception:
+                # finish() reports failure collectively after the forward.
+                pass
         # Runs on failure too: an MLA dedup source must still issue the layer
         # broadcast its peers are waiting for.
         if self.on_layer_ready is not None:
@@ -121,6 +135,12 @@ class LayerWiseLoadCounter:
         # Wait before dropping the entry: the load thread still completes the
         # layers the forward never waited on through it.
         landed = all(future.exception() is None for future in futures)
+        plan = self.native_plans.pop(index, None)
+        if plan is not None:
+            try:
+                plan.wait(self.num_layers - 1)
+            except Exception:
+                landed = False
         del self.futures[index]
         return landed
 
@@ -128,6 +148,7 @@ class LayerWiseLoadCounter:
         self.producer_index = -1
         self.consumer_index = -1
         self.futures.clear()
+        self.native_plans.clear()
 
 
 class UnifiedCacheLinker(ABC):

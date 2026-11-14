@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import threading
 from copy import deepcopy
 from queue import Empty, Queue
@@ -70,6 +71,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.page_wise_load = getattr(
             server_args, "mooncake_enable_page_wise_load", False
         )
+        self.read_plan_enabled = os.environ.get("SGLANG_MOONCAKE_READ_PLAN", "0") == "1"
 
         tp_rank = 0
         tp_size = get_parallel().tp_size
@@ -106,6 +108,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.storage = storage
         self.storage.mem_pool_host = self.pool_group
         self.storage.registered_pools = self.pools
+        if self.read_plan_enabled and not callable(
+            getattr(self.storage.store, "create_read_plan", None)
+        ):
+            raise ValueError(
+                "SGLANG_MOONCAKE_READ_PLAN requires native create_read_plan support."
+            )
         storage_suffix = _storage_suffix(
             rank_replicated=rank_replicated,
             tp_rank=tp_rank,
@@ -343,6 +351,40 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     logger.exception("Mooncake layer-wise load session cleanup failed")
 
     def _read_batches(self, counter_index, batches, started, start_sessions):
+        if getattr(self, "read_plan_enabled", False):
+            layouts = []
+            for name, (keys, locations) in batches.items():
+                pool = self.pools[name]
+                layers = []
+                for layer in range(self.num_layers):
+                    mapped = pool.layer_mapping.get(layer)
+                    indices = (
+                        ()
+                        if mapped is None
+                        else (mapped,)
+                        if isinstance(mapped, int)
+                        else tuple(mapped)
+                    )
+                    layers.append(
+                        [
+                            (*component[index], offsets[index])
+                            for component, offsets in zip(
+                                pool.buffer_meta, pool._component_offsets
+                            )
+                            for index in indices
+                        ]
+                    )
+                layouts.append((keys, locations, pool.packed, layers))
+            plan = self.storage.store.create_read_plan(
+                layouts,
+                self.num_layers,
+                page_wise=self.page_wise_load,
+                borrowed_sessions=not start_sessions,
+                buffer_owners=self.pools,
+            )
+            self.layer_done_counter.bind(counter_index, plan)
+            plan.run()
+            return
         if start_sessions:
             for keys, _ in batches.values():
                 result = self.storage.store.batch_get_session_start(keys)
