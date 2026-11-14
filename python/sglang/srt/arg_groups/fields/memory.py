@@ -237,6 +237,9 @@ class Memory(msgspec.Struct):
         bool,
         "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",
     ] = False
+    mooncake_enable_page_wise_load: A[
+        bool, "Restore every buffer of a Mooncake page in one storage read."
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention

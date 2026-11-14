@@ -127,6 +127,28 @@ class DevicePoolEntry:
     def prepare_locations(self, indices: torch.Tensor) -> list[int]:
         return self._rows(indices)
 
+    def get_prepared_page_range_meta(self, locations: list[int]):
+        """All stored buffers, in the same order as get_page_buffer_meta."""
+        ptrs, sizes, offsets = [], [], []
+        for row in locations:
+            page_ptrs, page_sizes, page_offsets = [], [], []
+            for component, component_offsets in zip(
+                self.buffer_meta, self._component_offsets
+            ):
+                for (base, stride, size), offset in zip(component, component_offsets):
+                    page_ptrs.append(base + row * stride)
+                    page_sizes.append(size)
+                    page_offsets.append(offset)
+            if self.packed:
+                ptrs.append(page_ptrs)
+                sizes.append(page_sizes)
+                offsets.append(page_offsets)
+            else:
+                ptrs.extend([[p] for p in page_ptrs])
+                sizes.extend([[s] for s in page_sizes])
+                offsets.extend([[0] for _ in page_offsets])
+        return ptrs, sizes, offsets
+
     def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
         mapped = self.layer_mapping.get(layer)
         if mapped is None:
