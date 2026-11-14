@@ -67,6 +67,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
+        self.page_wise_load = getattr(
+            server_args, "mooncake_enable_page_wise_load", False
+        )
 
         tp_rank = 0
         tp_size = get_parallel().tp_size
@@ -327,41 +330,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             transfer.host_indices
                         )
                     )
-            for keys, _ in batches.values():
-                result = self.storage.store.batch_get_session_start(keys)
-                if list(result) != [0] * len(keys):
-                    raise RuntimeError(
-                        f"Mooncake get session start failed: keys={len(keys)}, "
-                        f"results={result}"
-                    )
-                started.append(keys)
-
-            for layer in range(self.num_layers):
-                for name, (keys, locations) in batches.items():
-                    meta = self.pools[name].get_prepared_layer_range_meta(
-                        locations, layer
-                    )
-                    if meta is None:
-                        continue
-                    ptrs, sizes, offsets = meta
-                    result = self.storage.store.batch_get_into_multi_buffer_ranges(
-                        keys,
-                        ptrs,
-                        sizes,
-                        offsets,
-                    )
-                    expected = [sum(item) for item in sizes]
-                    if (
-                        result is None
-                        or isinstance(result, int)
-                        or list(result) != expected
-                    ):
-                        raise RuntimeError(
-                            f"Mooncake range get failed for pool={name}, "
-                            f"layer={layer}: transferred={result}, "
-                            f"expected={expected}"
-                        )
-                self.layer_done_counter.complete(counter_index, layer)
+            self._read_batches(counter_index, batches, started, True)
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
@@ -372,6 +341,46 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
+
+    def _read_batches(self, counter_index, batches, started, start_sessions):
+        if start_sessions:
+            for keys, _ in batches.values():
+                result = self.storage.store.batch_get_session_start(keys)
+                # A partial start still owns successful native sessions.
+                started.append(keys)
+                if list(result) != [0] * len(keys):
+                    raise RuntimeError(
+                        f"Mooncake get session start failed: keys={len(keys)}, "
+                        f"results={result}"
+                    )
+        if getattr(self, "page_wise_load", False):
+            for name, (keys, locations) in batches.items():
+                self._read_ranges(
+                    name, keys, self.pools[name].get_prepared_page_range_meta(locations)
+                )
+            for layer in range(self.num_layers):
+                self.layer_done_counter.complete(counter_index, layer)
+        else:
+            for layer in range(self.num_layers):
+                for name, (keys, locations) in batches.items():
+                    meta = self.pools[name].get_prepared_layer_range_meta(
+                        locations, layer
+                    )
+                    if meta is None:
+                        continue
+                    self._read_ranges(name, keys, meta)
+                self.layer_done_counter.complete(counter_index, layer)
+
+    def _read_ranges(self, name, keys, meta):
+        ptrs, sizes, offsets = meta
+        result = self.storage.store.batch_get_into_multi_buffer_ranges(
+            keys, ptrs, sizes, offsets
+        )
+        expected = [sum(parts) for parts in sizes]
+        if result is None or isinstance(result, int) or list(result) != expected:
+            raise RuntimeError(
+                f"Mooncake range get failed for pool={name}: transferred={result}, expected={expected}"
+            )
 
     def offload(
         self, transfers: list[PoolTransfer], session_id: str | None = None

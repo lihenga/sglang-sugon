@@ -41,6 +41,13 @@ def handle_hicache(server_args: Any):
         or cfg.unified_cache_external_linker_backend != "mooncake"
     ):
         raise ValueError("--enable-linker-mla-dedup requires the Mooncake linker.")
+    if cfg.mooncake_enable_page_wise_load and (
+        not cfg.enable_unified_cache_external_linker
+        or cfg.unified_cache_external_linker_backend != "mooncake"
+    ):
+        raise ValueError(
+            "Mooncake page-wise loading requires the Mooncake external linker."
+        )
     if cfg.enable_unified_cache_external_linker:
         if cfg.disable_radix_cache or cfg.radix_cache_backend is not None:
             raise ValueError(
