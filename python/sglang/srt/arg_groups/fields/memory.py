@@ -240,6 +240,19 @@ class Memory(msgspec.Struct):
     mooncake_enable_page_wise_load: A[
         bool, "Restore every buffer of a Mooncake page in one storage read."
     ] = False
+    mooncake_enable_waiting_queue_dfs_prefetch: A[
+        bool, "Stage collectively matched Mooncake pages in bounded host sessions."
+    ] = False
+    mooncake_waiting_queue_dfs_prefetch_workers: A[
+        int, "Background Mooncake host prefetch workers per rank."
+    ] = 1
+    mooncake_waiting_queue_dfs_prefetch_max_requests: A[
+        int, "Maximum waiting requests retaining Mooncake host prefetch sessions."
+    ] = 12
+    mooncake_waiting_queue_dfs_prefetch_max_bytes: A[
+        int,
+        "Aligned prefetch payload budget per rank; native allocation limits also apply.",
+    ] = 536870912
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention

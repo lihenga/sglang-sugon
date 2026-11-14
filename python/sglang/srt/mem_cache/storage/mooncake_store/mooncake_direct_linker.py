@@ -4,6 +4,7 @@ import hashlib
 import logging
 import os
 import threading
+from contextlib import nullcontext
 from copy import deepcopy
 from queue import Empty, Queue
 
@@ -19,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.storage.mooncake_store.session_prefetch import SessionPrefetch
 from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
     LinkerMLADedupBroadcaster,
 )
@@ -71,6 +73,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.page_wise_load = getattr(
             server_args, "mooncake_enable_page_wise_load", False
         )
+        self.prefetch_enabled = getattr(
+            server_args, "mooncake_enable_waiting_queue_dfs_prefetch", False
+        )
         self.read_plan_enabled = os.environ.get("SGLANG_MOONCAKE_READ_PLAN", "0") == "1"
 
         tp_rank = 0
@@ -113,6 +118,28 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ):
             raise ValueError(
                 "SGLANG_MOONCAKE_READ_PLAN requires native create_read_plan support."
+            )
+        self.sessions = None
+        if self.prefetch_enabled:
+            if not callable(
+                getattr(self.storage.store, "batch_get_session_prefetch", None)
+            ):
+                raise ValueError(
+                    "Mooncake waiting-queue prefetch requires native session prefetch support."
+                )
+            self.sessions = SessionPrefetch(
+                self.storage.store,
+                workers=getattr(
+                    server_args, "mooncake_waiting_queue_dfs_prefetch_workers", 1
+                ),
+                max_requests=getattr(
+                    server_args, "mooncake_waiting_queue_dfs_prefetch_max_requests", 12
+                ),
+                max_bytes=getattr(
+                    server_args,
+                    "mooncake_waiting_queue_dfs_prefetch_max_bytes",
+                    512 << 20,
+                ),
             )
         storage_suffix = _storage_suffix(
             rank_replicated=rank_replicated,
@@ -224,7 +251,38 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads[rid] = expanded
         return True
 
+    def prefetch(self, rid: str, transfers: list[PoolTransfer]) -> None:
+        if self.sessions is None:
+            return
+        if self.mla_broadcaster is not None and not self.mla_broadcaster.is_src:
+            return
+        sizes = {}
+        for transfer in self.pool_group.resolve_transfers(transfers):
+            keys, _ = self.storage._get_hybrid_page_component_keys(
+                list(transfer.keys), transfer
+            )
+            pool = self.pools[transfer.name]
+            object_sizes = [
+                size for component in pool.buffer_meta for _, _, size in component
+            ]
+            for index, key in enumerate(self.storage._tag_keys(keys)):
+                size = (
+                    sum(object_sizes)
+                    if pool.packed
+                    else object_sizes[index % len(object_sizes)]
+                )
+                alignment = int(os.environ.get("MOONCAKE_DFS_ALIGNMENT", "4096"))
+                if alignment < 1:
+                    raise ValueError("MOONCAKE_DFS_ALIGNMENT must be positive.")
+                sizes[key] = (size + alignment - 1) // alignment * alignment
+        self.sessions.submit(rid, sizes)
+
+    def cancel_prefetch(self, rid: str) -> None:
+        if self.sessions is not None:
+            self.sessions.release(rid)
+
     def cancel_queued_load(self, rid: str) -> bool:
+        self.cancel_prefetch(rid)
         return self.pending_loads.pop(rid, None) is not None
 
     def finish_layer_wise_loading(self, counter_index: int) -> bool:
@@ -317,6 +375,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
+                finally:
+                    for rid in pending:
+                        self.cancel_prefetch(rid)
             finally:
                 self.load_queue.task_done()
 
@@ -338,7 +399,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             transfer.host_indices
                         )
                     )
-            self._read_batches(counter_index, batches, started, True)
+            sessions = getattr(self, "sessions", None)
+            sizes = {}
+            if sessions is not None:
+                for name, (keys, locations) in batches.items():
+                    _, page_sizes, _ = self.pools[name].get_prepared_page_range_meta(
+                        locations
+                    )
+                    for key, parts in zip(keys, page_sizes):
+                        sizes[key] = sum(parts)
+            with sessions.acquire(sizes) if sessions is not None else nullcontext():
+                self._read_batches(counter_index, batches, started, sessions is None)
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
@@ -477,6 +548,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads.clear()
         self.load_queue.join()
         self.offload_queue.join()
+        if getattr(self, "sessions", None) is not None:
+            self.sessions.reset()
         self.broadcast_loads.clear()
         while True:
             try:
@@ -491,6 +564,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_queue.put(None)
         self.load_thread.join()
         self.offload_thread.join()
+        if getattr(self, "sessions", None) is not None:
+            self.sessions.close()
         logger.info("Mooncake direct linker stats: %s", self.stats)
         self.storage.close()
         if self.mla_broadcaster is not None:

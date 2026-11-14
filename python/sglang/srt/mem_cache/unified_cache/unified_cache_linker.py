@@ -197,6 +197,12 @@ class UnifiedCacheLinker(ABC):
         Local to this rank; the tree intersects the sets across ranks.
         """
 
+    def prefetch(self, rid: str, transfers: list[PoolTransfer]) -> None:
+        """Optionally stage a collectively restorable hit while it is waiting."""
+
+    def cancel_prefetch(self, rid: str) -> None:
+        """Release speculative host state without cancelling an active load."""
+
     @abstractmethod
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         """Queue a load into the given device indices.
@@ -319,10 +325,12 @@ class UnifiedCacheLinkerWrapper:
         page = cache.page_size
         device_hit_len = result.device_prefix_len
         if device_hit_len >= len(key):
+            self.cache_linker.cancel_prefetch(req.rid)
             return result
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
+            self.cache_linker.cancel_prefetch(req.rid)
             return result
 
         lookup_transfers = []
@@ -342,8 +350,21 @@ class UnifiedCacheLinkerWrapper:
             device_hit_pages=0,
         )
         if hit_pages == 0:
+            self.cache_linker.cancel_prefetch(req.rid)
             return result
         hit_tokens = hit_pages * page
+
+        if getattr(self.cache_linker, "prefetch_enabled", False):
+            prefetch_transfers = []
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOOKUP, None, tail_hashes[:hit_pages]
+                )
+                if transfer is None:
+                    break
+                prefetch_transfers.append(transfer)
+            else:
+                self.cache_linker.prefetch(req.rid, prefetch_transfers)
 
         swa_transfer = by_pool.get(PoolName.SWA)
         swa_host_hit_length = (
@@ -634,6 +655,7 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self.cache_linker.cancel_prefetch(rid)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):

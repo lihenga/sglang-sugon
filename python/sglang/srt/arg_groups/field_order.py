@@ -553,5 +553,9 @@ POSITIONAL_FIELD_ORDER = (
     "aux_hidden_state_capture",
     "return_aux_hidden_state_layer_ids",
     "mooncake_enable_page_wise_load",
+    "mooncake_enable_waiting_queue_dfs_prefetch",
+    "mooncake_waiting_queue_dfs_prefetch_workers",
+    "mooncake_waiting_queue_dfs_prefetch_max_requests",
+    "mooncake_waiting_queue_dfs_prefetch_max_bytes",
 )
 # fmt: on
