@@ -25,11 +25,6 @@ from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.quark.schemes import (
     QuarkLinearScheme,
     QuarkMoEScheme,
-    QuarkW4A4MXFP4,
-    QuarkW4A4MXFp4MoE,
-    QuarkW4A8MXFp4MoE,
-    QuarkW8A8Fp8,
-    QuarkW8A8FP8MoE,
 )
 from sglang.srt.layers.quantization.quark.utils import (
     Nvfp4SourceConfig,
@@ -1005,6 +1000,8 @@ class QuarkConfig(QuantizationConfig):
         input_config = cast(dict[str, Any], config.get("input_tensors"))
 
         if self._is_mx_fp4(weight_config, input_config):
+            from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFP4
+
             return QuarkW4A4MXFP4(
                 weight_config,
                 input_config,
@@ -1012,6 +1009,8 @@ class QuarkConfig(QuantizationConfig):
                 dequantization_config=self.dequantization_config,
             )
         if self._is_fp8_w8a8(weight_config, input_config):
+            from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
             is_fp8_w8a8_supported = self._check_scheme_supported(
                 QuarkW8A8Fp8.get_min_capability(), error=False
             )
@@ -1064,6 +1063,8 @@ class QuarkConfig(QuantizationConfig):
         input_config = layer_quant_config.get("input_tensors")
 
         if self._is_mx_fp4(weight_config, input_config):
+            from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
+
             return QuarkW4A4MXFp4MoE(
                 weight_config,
                 input_config,
@@ -1072,9 +1073,13 @@ class QuarkConfig(QuantizationConfig):
                 quantize_shared_expert_online=quantize_shared_expert_online,
             )
         elif self._is_mx_w4a8(weight_config, input_config):
+            from sglang.srt.layers.quantization.quark.schemes import QuarkW4A8MXFp4MoE
+
             logger.info_once("Using Quark MXFP4-W/FP8-A MoE scheme")
             return QuarkW4A8MXFp4MoE(weight_config, input_config)
         elif self._is_fp8_w8a8(weight_config, input_config):
+            from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8FP8MoE
+
             return QuarkW8A8FP8MoE(weight_config, input_config)
         else:
             raise RuntimeError("Unsupported FusedMoe scheme")
