@@ -136,6 +136,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     server_args, "mooncake_waiting_queue_dfs_prefetch_max_requests", 12
                 ),
             )
+            reporter = getattr(self.storage, "_client_metrics_reporter", None)
+            if reporter is not None:
+                reporter.set_extra_metrics(self.sessions.metrics)
         storage_suffix = _storage_suffix(
             rank_replicated=rank_replicated,
             tp_rank=tp_rank,

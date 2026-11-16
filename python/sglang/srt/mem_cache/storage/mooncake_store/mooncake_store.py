@@ -1,9 +1,11 @@
 import ctypes
+import ipaddress
 import json
 import logging
 import os
 import time
 import uuid
+import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
@@ -27,6 +29,8 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEn
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
@@ -42,6 +46,20 @@ def _local_buffer_size() -> int:
     if value < 0:
         raise ValueError("SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE must be nonnegative.")
     return value
+
+
+def _get_service_endpoint(server_args) -> str:
+    host = (
+        NetworkAddress.parse(server_args.dist_init_addr).host
+        if server_args.nnodes > 1
+        else server_args.host or "0.0.0.0"
+    )
+    address = ipaddress.ip_address(NetworkAddress.resolve_host(host))
+    if address.is_unspecified:
+        address = ipaddress.ip_address(get_local_ip_auto())
+    if address.is_unspecified or not 1 <= int(server_args.port) <= 65535:
+        raise ValueError("Cannot resolve the SGLang service endpoint.")
+    return NetworkAddress(str(address), int(server_args.port)).to_host_port_str()
 
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
@@ -418,6 +436,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def __init__(
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
+        self._client_metrics_reporter = None
         MooncakeBaseStore.__init__(self)
         self.dcp_size = storage_config.dcp_size if storage_config is not None else 1
         MooncakeDistributedStore = self._import_mooncake_store()
@@ -643,6 +662,34 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     f"Failed to setup Mooncake store, error code: {ret_code}"
                 )
             logger.info("Mooncake store setup successfully.")
+            try:
+                args = get_server_args()
+                if args.enable_metrics:
+                    endpoint = _get_service_endpoint(args)
+                    set_endpoint = getattr(self.store, "set_service_endpoint", None)
+                    if callable(set_endpoint) and set_endpoint(endpoint) != 0:
+                        logger.warning(
+                            "Mooncake service metrics endpoint registration failed"
+                        )
+                    if not self.config.standalone_storage:
+                        from sglang.srt.observability.mooncake_client_metrics import (
+                            start_client_metrics_reporter,
+                        )
+
+                        rank = (
+                            torch.distributed.get_rank()
+                            if torch.distributed.is_initialized()
+                            else 0
+                        )
+                        self._client_metrics_reporter = start_client_metrics_reporter(
+                            self.store, args, endpoint, rank
+                        )
+                        if self._client_metrics_reporter is not None:
+                            weakref.finalize(self, self._client_metrics_reporter.close)
+            except (RuntimeError, TypeError, ValueError, AttributeError):
+                logger.warning(
+                    "Mooncake metrics initialization unavailable", exc_info=True
+                )
 
             self.local_rank = (
                 storage_config.tp_rank if storage_config is not None else 0
@@ -1680,6 +1727,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return len(query_keys) // key_multiplier
 
     def close(self):
+        reporter = getattr(self, "_client_metrics_reporter", None)
+        if reporter is not None:
+            reporter.close()
+            self._client_metrics_reporter = None
         # MooncakeDistributedStore will automatically call the destructor, so
         # it is unnecessary to close it manually.
         pass

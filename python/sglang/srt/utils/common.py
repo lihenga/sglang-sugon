@@ -2844,8 +2844,15 @@ def add_prometheus_middleware(app):
     # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
     from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
 
+    from sglang.srt.observability.mooncake_client_metrics import (
+        MooncakeClientCollector,
+        add_snapshot_route,
+    )
+
     registry = CollectorRegistry()
     multiprocess.MultiProcessCollector(registry)
+    registry.register(MooncakeClientCollector())
+    add_snapshot_route(app)
     metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
 
     # Workaround for 307 Redirect for /metrics
@@ -3465,6 +3472,9 @@ class UvicornAccessLogFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         path = None
+        status_code = getattr(record, "status_code", None)
+        if isinstance(record.args, tuple) and len(record.args) == 5:
+            _, _, path, _, status_code = record.args
 
         request_line = getattr(record, "request_line", None)
         if request_line:
@@ -3501,6 +3511,8 @@ class UvicornAccessLogFilter(logging.Filter):
                 # If parsing fails, fall back to the raw value.
                 pass
         path = path.split("?", 1)[0]
+        if path == "/internal/mooncake_client_metrics" and str(status_code) == "204":
+            return False
         return not any(
             path.startswith(prefix) for prefix in self.excluded_path_prefixes
         )
@@ -3534,16 +3546,12 @@ def _configure_uvicorn_access_log_filter(
             - uvicorn_access_log_exclude_prefixes (list[str] | tuple[str] | None)
     """
     # Optionally filter uvicorn access logs (e.g., suppress noisy /metrics polling).
-    if server_args is None:
-        return
-
     filter_name = "sglang_uvicorn_access_path_filter"
 
     excluded_prefixes = getattr(
         server_args, "uvicorn_access_log_exclude_prefixes", None
     )
-    if not excluded_prefixes:
-        return
+    excluded_prefixes = excluded_prefixes or []
 
     # Normalize: accept list/tuple; treat a single string as one prefix (not an iterable of chars).
     if isinstance(excluded_prefixes, str):
@@ -3552,8 +3560,6 @@ def _configure_uvicorn_access_log_filter(
     # De-duplicate while keeping order; drop empty prefixes.
     excluded_prefixes = [p for p in excluded_prefixes if p]
     excluded_prefixes = list(dict.fromkeys(excluded_prefixes))
-    if not excluded_prefixes:
-        return
 
     uvicorn_logging_config.setdefault("filters", {})
     uvicorn_logging_config["filters"][filter_name] = {
