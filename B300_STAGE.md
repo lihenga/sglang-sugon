@@ -72,6 +72,46 @@ and DFS session-prefetch APIs required by the corresponding options. Use a
 matching build of `mooncake-das/v0.3.14_dev_l4_b300`; an older package importing
 successfully does not make these capabilities available.
 
+## Hybrid MLA replication and DFS sizing
+
+`SGLANG_MOONCAKE_SHARE_HYBRID_MLA_KV=1` stores the replicated FULL MLA KV
+once per attention TP group, while retaining separate Mamba and draft objects
+for each rank. It requires a plain MLA + Mamba pool without CP/DCP. The
+storage namespace receives a layout marker, so these objects do not collide
+with the original per-rank layout. This option is off by default.
+
+With that option, `--enable-linker-mla-dedup` also reads the replicated KV only
+on rank zero and broadcasts each ready layer over the existing NCCL group.
+Each rank still loads its own side states; their native completion counters
+gate the same forward. Cross-rank load-plan agreement and collective failure
+handling are preserved. This trades extra GPU communication for fewer DFS and
+host-to-device reads; measure both cold requests and cached-prefix requests.
+
+An explicit positive `dfs_replica_num` now checks that
+`MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES` can hold the largest physical page/state
+object. A K3 Mamba object in the tested TP8 layout is about 54 MiB, so a 16 MiB
+write chunk cannot publish it. Use a matching larger native chunk; successful
+asynchronous submission alone does not establish that an object became readable.
+
+The single-host POSIX experiment used 64 MiB write chunks, 256 MiB read chunks,
+8 GiB unified DFS buffers per rank, and a 0.75 prefetch capacity ratio. These
+are measured candidates for that host, not universal defaults. Buffered reads
+can reuse the host page cache. Record OS-cache state when comparing them with
+direct reads or recomputation. Full logs, per-request results, failed candidates
+and private-file cold-read checks are under
+`/jsyw/zhy_spcae/kimi-k3-v0522-mooncake-20261116/optimization-20261117/`.
+
+## Building the serving wheel
+
+Run `bash scripts/build_wheel.sh` from any directory. The script resolves the
+source tree from its own location and writes to the repository `dist/` by
+default. Use `--python`, `--output-dir`, or `--version` to override the active
+interpreter, destination, or source version. Exported sources without Git
+metadata require an explicit version. Existing pip, setuptools, wheel and
+setuptools-scm are used without network downloads or runtime dependency upgrades.
+Rust extensions default to disabled for this HTTP serving path; enabling them
+requires their corresponding Rust and PyTorch build dependencies.
+
 ## Metrics
 
 With `--enable-metrics`, embedded client snapshots are forwarded to the existing

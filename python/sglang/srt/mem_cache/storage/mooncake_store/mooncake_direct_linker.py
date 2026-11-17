@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    DevicePoolGroup,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.storage.mooncake_store.session_prefetch import SessionPrefetch
@@ -70,6 +71,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
+        if (extra_config or {}).get("dfs_replica_num", 0) > 0:
+            write_chunk = int(
+                os.environ.get("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", 1 << 30)
+            )
+            if write_chunk <= 0:
+                write_chunk = 1 << 30
+            largest_object = max(
+                (sum if pool.packed else max)(
+                    size for component in pool.buffer_meta for _, _, size in component
+                )
+                for pool in self.pools.values()
+            )
+            if largest_object > write_chunk:
+                raise ValueError(
+                    f"Mooncake DFS page/state object requires {largest_object} bytes; "
+                    f"MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES={write_chunk} is too small."
+                )
         self.page_wise_load = getattr(
             server_args, "mooncake_enable_page_wise_load", False
         )
@@ -147,6 +165,34 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
+        self.shared_mla_kv = (
+            os.environ.get("SGLANG_MOONCAKE_SHARE_HYBRID_MLA_KV", "0") == "1"
+        )
+        self.kv_offload_owner = tp_rank == 0
+        if self.shared_mla_kv:
+            from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+            if (
+                PoolName.MAMBA not in self.pools
+                or type(self.pools[PoolName.KV].device_pool) is not MLATokenToKVPool
+                or params.attn_cp_size != 1
+            ):
+                raise ValueError(
+                    "Shared hybrid MLA KV requires plain MLA + Mamba without CP."
+                )
+            # MLA KV is replicated; Mamba and draft states retain their TP suffixes.
+            self.storage.direct_pool_suffixes = {
+                PoolName.KV: _storage_suffix(
+                    rank_replicated=True,
+                    tp_rank=tp_rank,
+                    attn_cp_rank=params.attn_cp_rank,
+                    pp_rank=params.pp_rank,
+                )
+            }
+            self.storage.config_prefix = (
+                f"{self.storage.config_prefix}_hybrid_mla_shared_kv_v1"
+            )
+            logger.info("Shared hybrid MLA KV writes: owner=%s", self.kv_offload_owner)
         logger.info(
             "Mooncake direct linker storage topology: "
             "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
@@ -159,11 +205,26 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         self.register_buffers()
         self.mla_broadcaster = None
+        self.hybrid_mla_broadcast = False
         self.tp_group = tp_group
         self.broadcast_loads = {}
-        if server_args.enable_linker_mla_dedup and rank_replicated and tp_size > 1:
+        if (
+            server_args.enable_linker_mla_dedup
+            and (rank_replicated or self.shared_mla_kv)
+            and tp_size > 1
+        ):
+            broadcast_pools = self.pool_group
+            self.hybrid_mla_broadcast = not rank_replicated
+            if self.hybrid_mla_broadcast:
+                # Only FULL MLA is replicated; every rank restores its own side states.
+                broadcast_pools = DevicePoolGroup(
+                    [self.pools[PoolName.KV]],
+                    self.num_layers,
+                    self.page_size,
+                    rank_replicated=True,
+                )
             self.mla_broadcaster = LinkerMLADedupBroadcaster.build(
-                self.pool_group, params.tp_cache_group, params.attn_tp_cache_group
+                broadcast_pools, params.tp_cache_group, params.attn_tp_cache_group
             )
             logger.info(
                 "MLA linker rank-0 loading enabled: tp_rank=%d/%d", tp_rank, tp_size
@@ -252,10 +313,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def prefetch(self, rid: str, transfers: list[PoolTransfer]) -> None:
         if self.sessions is None:
             return
-        if self.mla_broadcaster is not None and not self.mla_broadcaster.is_src:
+        if (
+            self.mla_broadcaster is not None
+            and not self.mla_broadcaster.is_src
+            and not self.hybrid_mla_broadcast
+        ):
             return
         prefetch_keys = []
         for transfer in self.pool_group.resolve_transfers(transfers):
+            if (
+                self.hybrid_mla_broadcast
+                and not self.mla_broadcaster.is_src
+                and transfer.name == PoolName.KV
+            ):
+                continue
             keys, _ = self.storage._get_hybrid_page_component_keys(
                 list(transfer.keys), transfer
             )
@@ -271,8 +342,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return self.pending_loads.pop(rid, None) is not None
 
     def finish_layer_wise_loading(self, counter_index: int) -> bool:
-        # An MLA dedup peer's layers complete at start; its data arrives through
-        # the broadcast on the forward stream, ordered before any later reuse.
+        # Hybrid peers also wait for their native side-state reads before broadcasting KV.
         return self.layer_done_counter.finish(counter_index)
 
     def freeze_gc_once(self) -> None:
@@ -310,19 +380,32 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             indices = {}
             for transfers in pending.values():
                 for transfer in transfers:
+                    if transfer.name not in broadcaster.pools:
+                        continue
                     indices.setdefault(transfer.name, []).append(transfer.host_indices)
             prepared = broadcaster.prepare_broadcast(
                 {name: torch.cat(parts) for name, parts in indices.items()},
                 device_module.current_stream(),
             )
-            if not broadcaster.is_src:
+            if not broadcaster.is_src and not self.hybrid_mla_broadcast:
                 for layer in range(self.num_layers):
                     self.layer_done_counter.complete(counter_index, layer)
         ready_event = device_module.Event()
         ready_event.record()
         if broadcaster is not None:
             self.broadcast_loads[counter_index] = (0, prepared, ready_event)
-        if broadcaster is None or broadcaster.is_src:
+        if (
+            broadcaster is not None
+            and self.hybrid_mla_broadcast
+            and not broadcaster.is_src
+        ):
+            pending = {
+                rid: [
+                    transfer for transfer in transfers if transfer.name != PoolName.KV
+                ]
+                for rid, transfers in pending.items()
+            }
+        if broadcaster is None or broadcaster.is_src or self.hybrid_mla_broadcast:
             self.load_queue.put((counter_index, pending, ready_event))
         self.stats["load"] += len(pending)
         return counter_index
@@ -479,6 +562,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
+        if getattr(self, "shared_mla_kv", False) and not self.kv_offload_owner:
+            expanded = [
+                transfer for transfer in expanded if transfer.name != PoolName.KV
+            ]
+            # Queue empty writes too, preserving FIFO acknowledgements and slot lifetime.
         self.freeze_gc_once()
         if not self.offload_owner:
             self.offload_results.put(True)
