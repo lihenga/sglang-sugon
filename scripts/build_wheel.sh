@@ -46,6 +46,26 @@ if [ -z "$VERSION" ] && [ "$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/de
     echo 'Error: sources without Git metadata require --version VALUE.' >&2
     exit 1
 fi
+if [ -z "$VERSION" ] && [ -z "$(git -C "$REPO_ROOT" tag -l 'v[0-9]*')" ]; then
+    # Shallow branch exports may have no release tags; avoid an invented 0.1 version.
+    VERSION="$("$PYTHON" - "$REPO_ROOT" <<'PY'
+import re
+import subprocess
+import sys
+
+def git(*args):
+    return subprocess.check_output(['git', '-C', sys.argv[1], *args], text=True).strip()
+
+branch = git('branch', '--show-current')
+match = re.fullmatch(r'v(\d+\.\d+\.\d+)-([a-zA-Z0-9._-]+)', branch)
+if not match:
+    raise SystemExit('No release tags available; provide --version VALUE.')
+suffix = re.sub(r'[-_]+', '.', match[2]).lower()
+dirty = '.dirty' if git('status', '--porcelain', '--untracked-files=no') else ''
+print(f'{match[1]}+{suffix}.g{git("rev-parse", "--short=10", "HEAD")}{dirty}')
+PY
+)"
+fi
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 export SGLANG_BUILD_RUST_EXTS="${SGLANG_BUILD_RUST_EXTS:-none}"
