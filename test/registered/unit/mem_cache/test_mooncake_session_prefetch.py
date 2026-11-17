@@ -355,8 +355,24 @@ def test_overlapping_loads_disable_skipping_even_after_one_finishes(clock):
         manager.close()
 
 
-def test_only_stale_keys_are_refreshed(clock):
-    store = RefreshStore()
+@pytest.mark.parametrize("refresh_delay", [0, 28])
+def test_any_stale_key_refreshes_entire_batch(clock, refresh_delay):
+    class LeaseStore(RefreshStore):
+        def __init__(self):
+            super().__init__()
+            self.deadlines = {}
+
+        def batch_get_session_start(self, keys):
+            self.deadlines.update({key: clock.now + 30 for key in keys})
+            return super().batch_get_session_start(keys)
+
+        def batch_get_session_refresh(self, keys):
+            # Native BatchQuery counts the RPC's time against the returned TTL.
+            self.deadlines.update({key: clock.now + 30 for key in keys})
+            clock.now += refresh_delay
+            return super().batch_get_session_refresh(keys)
+
+    store = LeaseStore()
     manager = SessionPrefetch(store, refresh_age_s=5)
     try:
         prepare(manager, "old", ("old",))
@@ -364,9 +380,61 @@ def test_only_stale_keys_are_refreshed(clock):
         prepare(manager, "fresh", ("fresh",))
         clock.now += 2
         with manager.acquire(["old", "fresh"]):
+            assert all(clock.now < deadline for deadline in store.deadlines.values())
+        assert store.refreshed == [["old", "fresh"]]
+        assert manager.stats["refresh_skipped_keys"] == 0
+        assert manager.stats["refreshed_keys"] == 2
+    finally:
+        manager.close()
+
+
+def test_entire_young_private_batch_can_skip_refresh(clock):
+    store = RefreshStore()
+    manager = SessionPrefetch(store, refresh_age_s=5)
+    try:
+        prepare(manager, keys=("a", "b"))
+        clock.now += 4.9
+        with manager.acquire(["a", "b"]):
             pass
-        assert store.refreshed == [["old"]]
-        assert manager.stats["refresh_skipped_keys"] == 1
+        assert not store.refreshed
+        assert manager.stats["refresh_skipped_keys"] == 2
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("reason", ["shared", "unknown"])
+def test_one_unsafe_key_forces_refresh_of_young_batch(clock, reason):
+    store = RefreshStore()
+    manager = SessionPrefetch(store, refresh_age_s=5)
+    try:
+        prepare(manager, keys=("a", "b"))
+        if reason == "shared":
+            prepare(manager, "other", ("a",))
+        else:
+            manager.keys["a"].lease_bases.pop("a")
+        with manager.acquire(["a", "b"]):
+            pass
+        assert store.refreshed == [["a", "b"]]
+        assert manager.stats["refresh_skipped_keys"] == 0
+    finally:
+        manager.close()
+
+
+def test_partial_batch_refresh_failure_invalidates_all_lease_bases(clock):
+    store = RefreshStore()
+    manager = SessionPrefetch(store, refresh_age_s=5)
+    try:
+        prepare(manager, "old", ("old",))
+        clock.now += 4
+        prepare(manager, "fresh", ("fresh",))
+        clock.now += 2
+        store.refresh_result = [-1, 0]
+        with pytest.raises(RuntimeError, match="session refresh failed"):
+            with manager.acquire(["old", "fresh"]):
+                pytest.fail("failed refresh must not admit a load")
+        assert store.refreshed == [["old", "fresh"]]
+        assert not manager.keys["old"].lease_bases
+        assert not manager.keys["fresh"].lease_bases
     finally:
         manager.close()
 

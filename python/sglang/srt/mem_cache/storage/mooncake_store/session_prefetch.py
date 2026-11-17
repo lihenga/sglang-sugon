@@ -215,32 +215,34 @@ class SessionPrefetch:
             if keys and callable(refresh):
                 with self.lock:
                     now = time.monotonic()
-                    stale = [
-                        (key, batch)
-                        for key, batch in owners
-                        if key in batch.shared
+                    needs_refresh = any(
+                        key in batch.shared
                         or key not in batch.lease_bases
                         or not 0 <= now - batch.lease_bases[key] < self.refresh_age_s
-                    ]
-                    self.stats["refresh_skipped_keys"] += len(keys) - len(stale)
-                if stale:
+                        for key, batch in owners
+                    )
+                    if not needs_refresh:
+                        self.stats["refresh_skipped_keys"] += len(keys)
+                if needs_refresh:
+                    # Refresh the whole batch: a slow partial refresh could
+                    # outlive a lease that was young before the RPC started.
                     lease_base = time.monotonic()
                     try:
-                        results = list(refresh([key for key, _ in stale]))
-                        if len(results) != len(stale) or any(x != 0 for x in results):
+                        results = list(refresh(list(keys)))
+                        if len(results) != len(keys) or any(x != 0 for x in results):
                             raise RuntimeError(
                                 f"Mooncake session refresh failed: {results}"
                             )
                     except BaseException:
                         with self.lock:
-                            for key, batch in stale:
+                            for key, batch in owners:
                                 batch.lease_bases.pop(key, None)
                         raise
                     with self.lock:
-                        for key, batch in stale:
+                        for key, batch in owners:
                             if self.refresh_age_s and key not in batch.shared:
                                 batch.lease_bases[key] = lease_base
-                        self.stats["refreshed_keys"] += len(stale)
+                        self.stats["refreshed_keys"] += len(keys)
             yield
         finally:
             with self.lock:
