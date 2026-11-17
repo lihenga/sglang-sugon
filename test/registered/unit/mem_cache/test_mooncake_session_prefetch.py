@@ -1,9 +1,17 @@
 import threading
 from collections import Counter
+from types import SimpleNamespace
 
 import pytest
 
-from sglang.srt.mem_cache.storage.mooncake_store.session_prefetch import SessionPrefetch
+from sglang.srt.mem_cache.storage.mooncake_store import session_prefetch
+from sglang.srt.mem_cache.storage.mooncake_store.session_prefetch import (
+    SessionPrefetch,
+    session_refresh_age_from_env,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class Store:
@@ -200,3 +208,271 @@ def test_expired_waiting_lease_is_refreshed_without_restarting_prefetch():
         manager.release("waiting")
     finally:
         manager.close()
+
+
+class Clock:
+    now = 100.0
+
+    def __call__(self):
+        return self.now
+
+
+class RefreshStore(Store):
+    def __init__(self):
+        super().__init__()
+        self.refreshed = []
+        self.refresh_result = None
+        self.refresh_error = None
+
+    def batch_get_session_refresh(self, keys):
+        self.refreshed.append(list(keys))
+        if self.refresh_error is not None:
+            raise self.refresh_error
+        if self.refresh_result is not None:
+            return self.refresh_result
+        return [0] * len(keys)
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr(session_prefetch, "time", SimpleNamespace(monotonic=clock))
+    return clock
+
+
+def prepare(manager, rid="waiting", keys=("page",)):
+    assert manager.submit(rid, keys)
+    for key in keys:
+        manager.keys[key].future.result(timeout=5)
+
+
+def test_young_private_prefetch_skips_refresh_and_preserves_ownership(clock):
+    store = RefreshStore()
+    manager = SessionPrefetch(store, refresh_age_s=5)
+    try:
+        prepare(manager)
+        clock.now += 4.9
+        with manager.acquire(["page"]):
+            manager.release("waiting")
+            assert not store.ended
+        assert not store.refreshed
+        assert store.started["page"] == store.ended["page"] == 1
+        assert manager.stats["refresh_skipped_keys"] == 1
+    finally:
+        manager.close()
+
+
+def test_age_boundary_refreshes_then_young_session_can_skip(clock):
+    store = RefreshStore()
+    manager = SessionPrefetch(store, refresh_age_s=5)
+    try:
+        prepare(manager)
+        clock.now += 5
+        with manager.acquire(["page"]):
+            pass
+        clock.now += 0.1
+        with manager.acquire(["page"]):
+            pass
+        assert store.refreshed == [["page"]]
+        assert manager.stats["refreshed_keys"] == 1
+        assert manager.stats["refresh_skipped_keys"] == 1
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("phase", ["query", "prefetch"])
+def test_rpc_and_prefetch_time_count_toward_age(clock, phase):
+    class SlowStore(RefreshStore):
+        def batch_get_session_start(self, keys):
+            if phase == "query":
+                clock.now += 6
+            return super().batch_get_session_start(keys)
+
+        def batch_get_session_prefetch(self, keys):
+            if phase == "prefetch":
+                clock.now += 6
+            return super().batch_get_session_prefetch(keys)
+
+    store = SlowStore()
+    manager = SessionPrefetch(store, refresh_age_s=5)
+    try:
+        prepare(manager)
+        with manager.acquire(["page"]):
+            pass
+        assert store.refreshed == [["page"]]
+    finally:
+        manager.close()
+
+
+def test_timestamp_is_taken_when_worker_queries_not_when_queued(clock):
+    store = RefreshStore()
+    store.proceed.clear()
+    manager = SessionPrefetch(store, refresh_age_s=5)
+    try:
+        assert manager.submit("blocking", ["other"])
+        assert store.entered.wait(5)
+        assert manager.submit("waiting", ["page"])
+        clock.now += 10
+        store.proceed.set()
+        manager.keys["page"].future.result(timeout=5)
+        with manager.acquire(["page"]):
+            pass
+        assert not store.refreshed
+    finally:
+        store.proceed.set()
+        manager.close()
+
+
+def test_cross_request_shared_key_keeps_refreshing_after_one_cancels(clock):
+    store = RefreshStore()
+    manager = SessionPrefetch(store, refresh_age_s=5)
+    try:
+        prepare(manager, "first")
+        prepare(manager, "second")
+        manager.release("first")
+        with manager.acquire(["page"]):
+            pass
+        with manager.acquire(["page"]):
+            pass
+        assert store.refreshed == [["page"], ["page"]]
+        assert store.started["page"] == 1
+    finally:
+        manager.close()
+
+
+def test_overlapping_loads_disable_skipping_even_after_one_finishes(clock):
+    store = RefreshStore()
+    manager = SessionPrefetch(store, refresh_age_s=5)
+    try:
+        prepare(manager)
+        with manager.acquire(["page"]):
+            with manager.acquire(["page"]):
+                assert not store.ended
+        with manager.acquire(["page"]):
+            pass
+        assert store.refreshed == [["page"], ["page"]]
+    finally:
+        manager.close()
+
+
+def test_only_stale_keys_are_refreshed(clock):
+    store = RefreshStore()
+    manager = SessionPrefetch(store, refresh_age_s=5)
+    try:
+        prepare(manager, "old", ("old",))
+        clock.now += 4
+        prepare(manager, "fresh", ("fresh",))
+        clock.now += 2
+        with manager.acquire(["old", "fresh"]):
+            pass
+        assert store.refreshed == [["old"]]
+        assert manager.stats["refresh_skipped_keys"] == 1
+    finally:
+        manager.close()
+
+
+def test_unknown_lease_base_always_refreshes(clock):
+    store = RefreshStore()
+    manager = SessionPrefetch(store, refresh_age_s=5)
+    try:
+        prepare(manager)
+        manager.keys["page"].lease_bases.clear()
+        with manager.acquire(["page"]):
+            pass
+        assert store.refreshed == [["page"]]
+    finally:
+        manager.close()
+
+
+def test_failed_cleanup_forces_refresh_before_reusing_session(clock):
+    class FailedEndStore(RefreshStore):
+        def batch_get_session_end(self, keys):
+            return -1
+
+    store = FailedEndStore()
+    manager = SessionPrefetch(store, refresh_age_s=5)
+    try:
+        prepare(manager)
+        manager.release("waiting")
+        assert "page" in manager.keys
+        with manager.acquire(["page"]):
+            pass
+        assert store.refreshed == [["page"]]
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("result", [[], [-1], [0, 0], "exception"])
+def test_failed_refresh_invalidates_age_and_never_admits_load(clock, result):
+    store = RefreshStore()
+    manager = SessionPrefetch(store, refresh_age_s=5)
+    try:
+        prepare(manager)
+        clock.now += 5
+        if result == "exception":
+            store.refresh_error = OSError("master unavailable")
+        else:
+            store.refresh_result = result
+        with pytest.raises((RuntimeError, OSError)):
+            with manager.acquire(["page"]):
+                pytest.fail("failed refresh must not admit a load")
+        assert "page" not in manager.keys["page"].lease_bases
+        store.refresh_error = store.refresh_result = None
+        with manager.acquire(["page"]):
+            pass
+        assert store.refreshed == [["page"], ["page"]]
+    finally:
+        manager.close()
+
+
+def test_refresh_rpc_time_is_included_in_new_age(clock):
+    class SlowRefreshStore(RefreshStore):
+        def batch_get_session_refresh(self, keys):
+            clock.now += 6
+            return super().batch_get_session_refresh(keys)
+
+    store = SlowRefreshStore()
+    manager = SessionPrefetch(store, refresh_age_s=5)
+    try:
+        prepare(manager)
+        clock.now += 5
+        with manager.acquire(["page"]):
+            pass
+        with manager.acquire(["page"]):
+            pass
+        assert store.refreshed == [["page"], ["page"]]
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf", "invalid"])
+def test_invalid_refresh_age_is_rejected(monkeypatch, value):
+    monkeypatch.setenv("SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S", value)
+    with pytest.raises(ValueError):
+        session_refresh_age_from_env()
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "invalid"])
+def test_invalid_lease_ttl_is_rejected(monkeypatch, value):
+    monkeypatch.setenv("SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S", "5")
+    monkeypatch.setenv("SGLANG_MOONCAKE_LEASE_TTL_S", value)
+    with pytest.raises(ValueError):
+        session_refresh_age_from_env()
+
+
+def test_refresh_skip_configuration_guards_ttl_and_groups(monkeypatch):
+    monkeypatch.delenv("SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S", raising=False)
+    monkeypatch.delenv("SGLANG_MOONCAKE_LEASE_TTL_S", raising=False)
+    assert session_refresh_age_from_env() == 0
+    monkeypatch.setenv("SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S", "5")
+    monkeypatch.setenv("SGLANG_MOONCAKE_LEASE_TTL_S", "30")
+    assert session_refresh_age_from_env() == 5
+    assert session_refresh_age_from_env(group_semantics=True) == 0
+    monkeypatch.setenv("SGLANG_MOONCAKE_LEASE_TTL_S", "5")
+    assert session_refresh_age_from_env() == 0
+    monkeypatch.setenv("SGLANG_MOONCAKE_LEASE_TTL_S", "4")
+    assert session_refresh_age_from_env() == 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

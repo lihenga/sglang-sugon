@@ -21,7 +21,10 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolGroup,
     resolve_hybrid_device_pool_group,
 )
-from sglang.srt.mem_cache.storage.mooncake_store.session_prefetch import SessionPrefetch
+from sglang.srt.mem_cache.storage.mooncake_store.session_prefetch import (
+    SessionPrefetch,
+    session_refresh_age_from_env,
+)
 from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
     LinkerMLADedupBroadcaster,
 )
@@ -147,6 +150,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 )
             self.sessions = SessionPrefetch(
                 self.storage.store,
+                refresh_age_s=session_refresh_age_from_env(
+                    group_semantics=getattr(
+                        self.storage, "_can_use_group_semantics", lambda: False
+                    )()
+                ),
                 workers=getattr(
                     server_args, "mooncake_waiting_queue_dfs_prefetch_workers", 1
                 ),
