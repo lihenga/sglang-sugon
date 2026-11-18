@@ -65,6 +65,11 @@ class SessionPrefetch:
         self.store = store
         self.max_requests = max_requests
         self.refresh_age_s = refresh_age_s
+        self.trace_enabled = os.environ.get("MC_STORE_DFS_READ_TRACE", "0").lower() in (
+            "1",
+            "true",
+            "on",
+        )
         self.executor = ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="mooncake-prefetch"
         )
@@ -75,6 +80,7 @@ class SessionPrefetch:
         self.stats = Counter()
 
     def _prepare(self, batch, prefetch):
+        trace_start = time.perf_counter() if self.trace_enabled else None
         keys = list(batch.keys)
         start_with_sources = getattr(
             self.store, "batch_get_session_start_with_sources", None
@@ -105,6 +111,15 @@ class SessionPrefetch:
             for key, result, source in zip(keys, results, sources)
             if result == 0 and source in ("dfs", "unknown")
         ]
+        if trace_start is not None:
+            logger.info(
+                "Mooncake linker trace: stage=session_start keys=%d prefetch=%s sources=%s ms=%.3f",
+                len(keys),
+                prefetch,
+                dict(Counter(sources)),
+                (time.perf_counter() - trace_start) * 1000,
+            )
+            trace_start = time.perf_counter()
         if prefetch and good:
             try:
                 copied = list(self.store.batch_get_session_prefetch(good))
@@ -120,6 +135,12 @@ class SessionPrefetch:
                 logger.warning(
                     "Mooncake host prefetch failed; using normal reads", exc_info=True
                 )
+        if trace_start is not None and prefetch and good:
+            logger.info(
+                "Mooncake linker trace: stage=host_prefetch keys=%d ms=%.3f",
+                len(good),
+                (time.perf_counter() - trace_start) * 1000,
+            )
         return dict(zip(keys, results))
 
     def _retain(self, keys, prefetch):
@@ -196,6 +217,7 @@ class SessionPrefetch:
     @contextmanager
     def acquire(self, keys):
         """Hold sessions through the caller's synchronous device-copy boundary."""
+        trace_start = time.perf_counter() if self.trace_enabled else None
         keys = tuple(dict.fromkeys(keys))
         with self.lock:
             if self.closed:
@@ -207,10 +229,17 @@ class SessionPrefetch:
                         batch.shared.add(key)
                         batch.lease_bases.pop(key, None)
                     batch.loading[key] += 1
+        trace_wait_start = time.perf_counter() if trace_start is not None else None
         try:
             for key, batch in owners:
                 if batch.future.result()[key] != 0:
                     raise RuntimeError(f"Mooncake session start failed for {key}")
+            trace_wait_ms = (
+                (time.perf_counter() - trace_wait_start) * 1000
+                if trace_wait_start is not None
+                else 0.0
+            )
+            trace_refresh_ms = 0.0
             refresh = getattr(self.store, "batch_get_session_refresh", None)
             if keys and callable(refresh):
                 with self.lock:
@@ -228,7 +257,14 @@ class SessionPrefetch:
                     # outlive a lease that was young before the RPC started.
                     lease_base = time.monotonic()
                     try:
+                        trace_refresh_start = (
+                            time.perf_counter() if trace_start is not None else None
+                        )
                         results = list(refresh(list(keys)))
+                        if trace_refresh_start is not None:
+                            trace_refresh_ms = (
+                                time.perf_counter() - trace_refresh_start
+                            ) * 1000
                         if len(results) != len(keys) or any(x != 0 for x in results):
                             raise RuntimeError(
                                 f"Mooncake session refresh failed: {results}"
@@ -243,6 +279,14 @@ class SessionPrefetch:
                             if self.refresh_age_s and key not in batch.shared:
                                 batch.lease_bases[key] = lease_base
                         self.stats["refreshed_keys"] += len(keys)
+            if trace_start is not None:
+                logger.info(
+                    "Mooncake linker trace: stage=session_acquire keys=%d future_wait_ms=%.3f refresh_ms=%.3f ms=%.3f",
+                    len(keys),
+                    trace_wait_ms,
+                    trace_refresh_ms,
+                    (time.perf_counter() - trace_start) * 1000,
+                )
             yield
         finally:
             with self.lock:

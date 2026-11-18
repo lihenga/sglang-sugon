@@ -4,6 +4,7 @@ import hashlib
 import logging
 import os
 import threading
+import time
 from contextlib import nullcontext
 from copy import deepcopy
 from queue import Empty, Queue
@@ -98,6 +99,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             server_args, "mooncake_enable_waiting_queue_dfs_prefetch", False
         )
         self.read_plan_enabled = os.environ.get("SGLANG_MOONCAKE_READ_PLAN", "0") == "1"
+        self.trace_enabled = os.environ.get("MC_STORE_DFS_READ_TRACE", "0").lower() in (
+            "1",
+            "true",
+            "on",
+        )
 
         tp_rank = 0
         tp_size = get_parallel().tp_size
@@ -285,6 +291,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        trace_start = time.perf_counter() if self.trace_enabled else None
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
@@ -294,6 +301,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return []
         result = self.storage.batch_exists_v2(page_keys, expanded)
         restorable = result.restorable_prefix_pages or []
+        if trace_start is not None:
+            logger.info(
+                "Mooncake linker trace: stage=lookup rid=%s pages=%d hit_pages=%d ms=%.3f",
+                rid,
+                len(page_keys),
+                restorable[-1] if restorable else 0,
+                (time.perf_counter() - trace_start) * 1000,
+            )
         self.stats["lookup"] += 1
         if restorable:
             logger.info(
@@ -460,6 +475,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def load_layer_wise(
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
     ) -> None:
+        trace_start = time.perf_counter() if self.trace_enabled else None
         started = []
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
@@ -477,6 +493,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
             sessions = getattr(self, "sessions", None)
             keys = [key for batch_keys, _ in batches.values() for key in batch_keys]
+            if trace_start is not None:
+                logger.info(
+                    "Mooncake linker trace: stage=load_metadata batch=%d requests=%d keys=%d ms=%.3f",
+                    counter_index,
+                    len(request_transfers),
+                    len(keys),
+                    (time.perf_counter() - trace_start) * 1000,
+                )
             with sessions.acquire(keys) if sessions is not None else nullcontext():
                 self._read_batches(counter_index, batches, started, sessions is None)
         except BaseException as error:
@@ -489,9 +513,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
+            if trace_start is not None:
+                logger.info(
+                    "Mooncake linker trace: stage=load_total batch=%d requests=%d ms=%.3f",
+                    counter_index,
+                    len(request_transfers),
+                    (time.perf_counter() - trace_start) * 1000,
+                )
 
     def _read_batches(self, counter_index, batches, started, start_sessions):
         if getattr(self, "read_plan_enabled", False):
+            trace_start = time.perf_counter() if self.trace_enabled else None
             layouts = []
             for name, (keys, locations) in batches.items():
                 pool = self.pools[name]
@@ -523,7 +555,21 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 buffer_owners=self.pools,
             )
             self.layer_done_counter.bind(counter_index, plan)
+            if trace_start is not None:
+                logger.info(
+                    "Mooncake linker trace: stage=plan_build batch=%d page_wise=%s ms=%.3f",
+                    counter_index,
+                    self.page_wise_load,
+                    (time.perf_counter() - trace_start) * 1000,
+                )
+                trace_start = time.perf_counter()
             plan.run()
+            if trace_start is not None:
+                logger.info(
+                    "Mooncake linker trace: stage=plan_run batch=%d ms=%.3f",
+                    counter_index,
+                    (time.perf_counter() - trace_start) * 1000,
+                )
             return
         if start_sessions:
             for keys, _ in batches.values():
