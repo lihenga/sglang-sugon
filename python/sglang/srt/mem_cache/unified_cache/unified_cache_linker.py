@@ -200,6 +200,13 @@ class UnifiedCacheLinker(ABC):
     def prefetch(self, rid: str, transfers: list[PoolTransfer]) -> None:
         """Optionally stage a collectively restorable hit while it is waiting."""
 
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        """Return an optional rank-local DFS read/write policy candidate."""
+        return None
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        """Apply the effective policy agreed by the cache's attention ranks."""
+
     def cancel_prefetch(self, rid: str) -> None:
         """Release speculative host state without cancelling an active load."""
 
@@ -316,6 +323,15 @@ class UnifiedCacheLinkerWrapper:
 
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
+
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        getter = getattr(self.cache_linker, "get_local_dfs_health_policy", None)
+        return getter() if callable(getter) else None
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        apply_policy = getattr(self.cache_linker, "apply_dfs_health_policy", None)
+        if callable(apply_policy):
+            apply_policy(allow_read, allow_write)
 
     # ---- match: probe the remote store and report host_hit_length ----
 

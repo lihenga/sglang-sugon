@@ -19,6 +19,9 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     _local_buffer_size,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import LayerWiseLoadCounter
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class HostStore:
@@ -57,6 +60,7 @@ def make_linker(page_wise):
         rows_are_pages=True,
     )
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.trace_enabled = False
     linker.pools = {PoolName.KV: pool}
     linker.num_layers = 3
     linker.page_wise_load = page_wise

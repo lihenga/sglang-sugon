@@ -434,9 +434,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return total
 
     def __init__(
-        self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
+        self,
+        storage_config: HiCacheStorageConfig = None,
+        mem_pool: HostKVCache = None,
+        dfs_health_config: Optional[dict[str, int]] = None,
     ):
         self._client_metrics_reporter = None
+        self._dfs_health_manager = None
         MooncakeBaseStore.__init__(self)
         self.dcp_size = storage_config.dcp_size if storage_config is not None else 1
         MooncakeDistributedStore = self._import_mooncake_store()
@@ -455,6 +459,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            if dfs_health_config is None and extra_config:
+                dfs_health_config = extra_config.get("_mooncake_dfs_health_config")
             self.write_replica_config = {
                 native: extra_config[option]
                 for option, native in (
@@ -691,11 +697,57 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     "Mooncake metrics initialization unavailable", exc_info=True
                 )
 
+            if (
+                os.environ.get("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR")
+                == "distributed_storage_backend"
+            ):
+                from sglang.srt.mem_cache.storage.mooncake_store.compat import (
+                    supports_dfs_health,
+                )
+
+                if supports_dfs_health(self.store):
+                    from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+                        MooncakeDfsHealthManager,
+                    )
+
+                    coordinate_policy = (
+                        storage_config is not None
+                        and torch.distributed.is_available()
+                        and torch.distributed.is_initialized()
+                        and (
+                            storage_config.tp_size > 1
+                            or storage_config.attn_cp_size > 1
+                        )
+                    )
+                    self._dfs_health_manager = MooncakeDfsHealthManager(
+                        self.store,
+                        dfs_health_config,
+                        defer_policy_application=coordinate_policy,
+                    )
+                    weakref.finalize(self, self._dfs_health_manager.close)
+                else:
+                    logger.warning(
+                        "Mooncake package lacks DFS health/policy APIs; preserving "
+                        "legacy DFS behavior without SGLang health-based failover."
+                    )
+
             self.local_rank = (
                 storage_config.tp_rank if storage_config is not None else 0
             )
-            self.warmup()
-            logger.info("Mooncake store warmup successfully.")
+            dfs_only = (
+                self.write_replica_config.get("replica_num") == 0
+                and self.write_replica_config.get("dfs_replica_num", 0) > 0
+            )
+            if self._dfs_health_manager is not None and dfs_only:
+                # No MEMORY replica can serve the startup self-test while DFS
+                # is fail-closed. Probes validate DFS before policy opens it.
+                logger.info(
+                    "Skipping Mooncake data warmup for DFS-only storage; "
+                    "DFS access remains gated by health probes."
+                )
+            else:
+                self.warmup()
+                logger.info("Mooncake store warmup successfully.")
 
             self.enable_storage_metrics = False
             if storage_config is not None:
@@ -752,6 +804,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.backup_pgs = []
             self.prefetch_bandwidth = []
             self.backup_bandwidth = []
+
+            if self._dfs_health_manager is not None:
+                self._dfs_health_manager.start()
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -1730,13 +1785,24 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return len(query_keys) // key_multiplier
 
     def close(self):
+        manager = getattr(self, "_dfs_health_manager", None)
+        if manager is not None:
+            manager.close()
+            self._dfs_health_manager = None
         reporter = getattr(self, "_client_metrics_reporter", None)
         if reporter is not None:
             reporter.close()
             self._client_metrics_reporter = None
         # MooncakeDistributedStore will automatically call the destructor, so
         # it is unnecessary to close it manually.
-        pass
+
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        manager = self._dfs_health_manager
+        return None if manager is None else manager.local_policy()
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        if self._dfs_health_manager is not None:
+            self._dfs_health_manager.apply_effective_policy(allow_read, allow_write)
 
     def clear(self) -> None:
         self.store.remove_all()
