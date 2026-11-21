@@ -177,6 +177,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         rank_replicated = self.pool_group.rank_replicated
         self.offload_owner = not rank_replicated or tp_rank == 0
         extra_config = deepcopy(extra_config or {})
+        from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+            resolve_dfs_health_config,
+        )
+
+        extra_config["_mooncake_dfs_health_config"] = resolve_dfs_health_config(
+            extra_config.get("_mooncake_dfs_health_config"), server_args=server_args
+        )
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
         # storage keys, so it waits for a storage-key format change.
@@ -712,6 +719,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def pop_completed_offload(self) -> bool:
         return self.offload_results.get_nowait()
+
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        return self.storage.get_local_dfs_health_policy()
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        self.storage.apply_dfs_health_policy(allow_read, allow_write)
 
     def reset(self) -> None:
         self.pending_loads.clear()

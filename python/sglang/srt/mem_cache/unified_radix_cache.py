@@ -499,6 +499,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 storage_extra_config.setdefault(
                     "file_storage_path", server_args.file_storage_path
                 )
+            if storage_backend == "mooncake":
+                from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+                    resolve_dfs_health_config,
+                )
+
+                storage_extra_config = dict(storage_extra_config or {})
+                storage_extra_config["_mooncake_dfs_health_config"] = (
+                    resolve_dfs_health_config(
+                        storage_extra_config.get("_mooncake_dfs_health_config"),
+                        server_args=server_args,
+                    )
+                )
         storage_prefetch_threshold = (
             self._storage_attachment.resolve_prefetch_threshold(
                 storage_prefetch_threshold
@@ -3648,8 +3660,25 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         return failed
 
+    def _sync_dfs_health_policy(self) -> None:
+        """Apply one conservative DFS policy across attention CP/TP ranks."""
+        owner = self.linker
+        if owner is None and self.cache_controller is not None:
+            owner = self.cache_controller.storage_backend
+        getter = getattr(owner, "get_local_dfs_health_policy", None)
+        apply_policy = getattr(owner, "apply_dfs_health_policy", None)
+        if not callable(getter) or not callable(apply_policy):
+            return
+        local_policy = getter()
+        if local_policy is None:
+            return
+        effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
+        self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
+        apply_policy(*(bool(value) for value in effective.tolist()))
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        self._sync_dfs_health_policy()
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [self.linker.num_completed_offloads()],

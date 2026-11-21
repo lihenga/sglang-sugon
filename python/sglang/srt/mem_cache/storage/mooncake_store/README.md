@@ -502,6 +502,41 @@ In such cases, you should manually configure an appropriate L2 cache size based 
 
 Additional troubleshooting information can be found [here](https://kvcache-ai.github.io/Mooncake/troubleshooting/troubleshooting.html).
 
+## DFS health probing
+
+With `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend`,
+SGLang probes DFS reads and writes independently when the Mooncake package exposes
+`probe_dfs_read()`, `probe_dfs_write()` and `set_dfs_access_policy()`.
+An explicit `get_capabilities().features.dfs_health=false` disables this feature;
+older packages without the complete API retain their existing behavior with a
+warning. The B300 L4 package already provides the required native APIs.
+
+DFS access starts disabled before storage warmup, so native memory-only fallback
+remains available while DFS health is unknown. Consecutive successes restore each
+capability; consecutive failures disable it. Attention CP/TP ranks apply the MIN
+of their local policies during cache event polling. Timed-out probe results are
+discarded, even if they later succeed. Storage shutdown stops the probe loop.
+
+| CLI option | Environment fallback | Default |
+| --- | --- | --- |
+| `--mooncake-dfs-health-probe-interval-s` | `SGLANG_MOONCAKE_DFS_HEALTH_PROBE_INTERVAL_S` | 10 seconds |
+| `--mooncake-dfs-health-failure-threshold` | `SGLANG_MOONCAKE_DFS_HEALTH_FAILURE_THRESHOLD` | 3 |
+| `--mooncake-dfs-health-success-threshold` | `SGLANG_MOONCAKE_DFS_HEALTH_SUCCESS_THRESHOLD` | 3 |
+| `--mooncake-dfs-health-probe-timeout-s` | `SGLANG_MOONCAKE_DFS_HEALTH_PROBE_TIMEOUT_S` | 2 seconds |
+
+Values must be positive integers. Explicit health config takes precedence over
+CLI values, then environment variables, then defaults. DirectLinker and startup
+HiCache use the same resolver. A read failure does not by itself disable writes,
+and a write failure does not by itself disable reads.
+
+The timeout bounds Python's wait, not the underlying native I/O. Each capability
+keeps at most one native probe in flight; if it remains stuck, that capability
+stays disabled until the call returns and a fresh probe succeeds. This port does
+not include replacement probes, PP-wide health consensus or native `timeout_ms`
+support from later changes.
+Configure usable MEMORY replicas if startup while DFS is unavailable is required;
+a DFS-only replica configuration cannot provide memory-only fallback.
+
 ## Test Mooncake Store
 
 This test is intended for developers to quickly verify that the MooncakeStore class interfaces are functioning correctly.

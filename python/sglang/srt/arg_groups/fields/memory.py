@@ -249,6 +249,18 @@ class Memory(msgspec.Struct):
     mooncake_waiting_queue_dfs_prefetch_max_requests: A[
         int, "Maximum waiting requests retaining Mooncake host prefetch sessions."
     ] = 12
+    mooncake_dfs_health_probe_interval_s: A[
+        Optional[int], "Interval in seconds between Mooncake DFS health probes."
+    ] = None
+    mooncake_dfs_health_failure_threshold: A[
+        Optional[int], "Consecutive failed probes required to disable DFS access."
+    ] = None
+    mooncake_dfs_health_success_threshold: A[
+        Optional[int], "Consecutive successful probes required to restore DFS access."
+    ] = None
+    mooncake_dfs_health_probe_timeout_s: A[
+        Optional[int], "Timeout in seconds for a Mooncake DFS health probe."
+    ] = None
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
