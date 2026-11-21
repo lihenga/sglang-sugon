@@ -188,6 +188,60 @@ def test_legacy_package_without_health_keeps_existing_behavior(monkeypatch):
     store.close()
 
 
+@pytest.mark.parametrize("health_supported", [True, False])
+def test_dfs_only_startup_does_not_write_before_health_opens(
+    monkeypatch, health_supported
+):
+    monkeypatch.setenv(
+        "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR", "distributed_storage_backend"
+    )
+
+    class Store(NativeStore):
+        def get_capabilities(self):
+            return {"features": {"dfs_health": health_supported}}
+
+    config = HiCacheStorageConfig(
+        tp_rank=0,
+        tp_size=2,
+        pp_rank=0,
+        pp_size=1,
+        attn_cp_rank=0,
+        attn_cp_size=1,
+        is_mla_model=False,
+        enable_storage_metrics=False,
+        is_page_first_layout=True,
+        model_name=None,
+        extra_config={
+            "master_server_address": "127.0.0.1:50051",
+            "check_server": False,
+            "memory_replica_num": 0,
+            "dfs_replica_num": 1,
+            "_mooncake_dfs_health_config": {"success_threshold": 1},
+        },
+    )
+    with (
+        patch.object(MooncakeStore, "_import_mooncake_store", return_value=Store),
+        patch.object(MooncakeStore, "warmup") as warmup,
+        patch.object(torch.distributed, "is_initialized", return_value=True),
+        patch.object(torch.distributed, "get_rank", return_value=0),
+        patch.object(MooncakeDfsHealthManager, "start"),
+    ):
+        store = MooncakeStore(config)
+    if health_supported:
+        warmup.assert_not_called()
+        assert store.store.policies == [(False, False)]
+        store._dfs_health_manager.probe_once()
+        assert store.get_local_dfs_health_policy() == (True, True)
+        # A local success must still wait for the attention-rank verdict.
+        assert store.store.policies == [(False, False)]
+        store.apply_dfs_health_policy(True, True)
+        assert store.store.policies[-1] == (True, True)
+    else:
+        warmup.assert_called_once()
+        assert store.store.policies == []
+    store.close()
+
+
 @pytest.mark.parametrize("use_linker", [True, False])
 def test_cache_applies_attention_group_minimum(use_linker):
     applied = []

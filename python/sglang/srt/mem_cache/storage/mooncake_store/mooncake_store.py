@@ -734,8 +734,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.local_rank = (
                 storage_config.tp_rank if storage_config is not None else 0
             )
-            self.warmup()
-            logger.info("Mooncake store warmup successfully.")
+            dfs_only = (
+                self.write_replica_config.get("replica_num") == 0
+                and self.write_replica_config.get("dfs_replica_num", 0) > 0
+            )
+            if self._dfs_health_manager is not None and dfs_only:
+                # No MEMORY replica can serve the startup self-test while DFS
+                # is fail-closed. Probes validate DFS before policy opens it.
+                logger.info(
+                    "Skipping Mooncake data warmup for DFS-only storage; "
+                    "DFS access remains gated by health probes."
+                )
+            else:
+                self.warmup()
+                logger.info("Mooncake store warmup successfully.")
 
             self.enable_storage_metrics = False
             if storage_config is not None:

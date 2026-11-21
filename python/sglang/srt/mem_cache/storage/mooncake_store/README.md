@@ -534,8 +534,12 @@ keeps at most one native probe in flight; if it remains stuck, that capability
 stays disabled until the call returns and a fresh probe succeeds. This port does
 not include replacement probes, PP-wide health consensus or native `timeout_ms`
 support from later changes.
-Configure usable MEMORY replicas if startup while DFS is unavailable is required;
-a DFS-only replica configuration cannot provide memory-only fallback.
+For explicit DFS-only writes (`memory_replica_num=0, dfs_replica_num>0`), startup
+skips the storage data warmup because the initial policy leaves no writable
+replica. Probes validate DFS before the effective policy opens it. Requests may
+compute without external cache while DFS is disabled; a DFS-only configuration
+does not provide MEMORY storage fallback. Configurations with MEMORY replicas
+keep the normal data warmup.
 
 ## Test Mooncake Store
 
