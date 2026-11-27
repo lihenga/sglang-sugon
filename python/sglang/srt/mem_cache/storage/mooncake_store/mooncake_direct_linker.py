@@ -217,8 +217,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 raise ValueError(
                     "Mooncake waiting-queue prefetch requires native session prefetch support."
                 )
+            reporter = getattr(self.storage, "_client_metrics_reporter", None)
             self.sessions = SessionPrefetch(
                 self.storage.store,
+                enable_metrics=reporter is not None,
                 refresh_age_s=session_refresh_age_from_env(
                     group_semantics=getattr(
                         self.storage, "_can_use_group_semantics", lambda: False
@@ -231,7 +233,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     server_args, "mooncake_waiting_queue_dfs_prefetch_max_requests", 12
                 ),
             )
-            reporter = getattr(self.storage, "_client_metrics_reporter", None)
             if reporter is not None:
                 reporter.set_extra_metrics(self.sessions.metrics)
         storage_suffix = _storage_suffix(
@@ -513,6 +514,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 counter_index, pending, ready_event = task
                 try:
                     ready_event.synchronize()
+                    if self.sessions is not None:
+                        for rid in pending:
+                            self.sessions.claim(rid)
                     self.load_layer_wise(counter_index, list(pending.values()))
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)

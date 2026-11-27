@@ -45,6 +45,17 @@ class _Batch:
     lease_bases: dict[str, float] = field(default_factory=dict)
     shared: set[str] = field(default_factory=set)
     loading: Counter = field(default_factory=Counter)
+    results: dict[str, str] = field(default_factory=dict)
+    completed_at: float = 0.0
+
+
+@dataclass
+class _Request:
+    owners: list
+    submitted_at: float | None = None
+    claimed: bool = False
+    result: str | None = None
+    ready_at: float = 0.0
 
 
 class SessionPrefetch:
@@ -54,7 +65,15 @@ class SessionPrefetch:
     can share one arena. Capacity is managed by Mooncake's native arena.
     """
 
-    def __init__(self, store, *, workers=1, max_requests=12, refresh_age_s=0.0):
+    def __init__(
+        self,
+        store,
+        *,
+        workers=1,
+        max_requests=12,
+        refresh_age_s=0.0,
+        enable_metrics=False,
+    ):
         if workers < 1 or max_requests < 1:
             raise ValueError("Mooncake prefetch limits must be positive.")
         if not math.isfinite(refresh_age_s) or refresh_age_s < 0:
@@ -78,8 +97,39 @@ class SessionPrefetch:
         self.requests = {}
         self.closed = False
         self.stats = Counter()
+        self.metric_registry = None
+        if enable_metrics:
+            from prometheus_client import CollectorRegistry, Histogram
+
+            # Export through the existing client snapshot, not the worker registry.
+            self.metric_registry = CollectorRegistry()
+            buckets = (0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 300)
+            self.duration = Histogram(
+                "mooncake_direct_prefetch_duration_seconds",
+                "Request admission to session/prefetch preparation or cancellation",
+                ("result",),
+                buckets=buckets,
+                registry=self.metric_registry,
+            )
+            self.ready_lead = Histogram(
+                "mooncake_direct_prefetch_ready_lead_seconds",
+                "Completed native prefetch to load-worker claim; excludes unready claims",
+                buckets=buckets,
+                registry=self.metric_registry,
+            )
 
     def _prepare(self, batch, prefetch):
+        try:
+            return self._prepare_sessions(batch, prefetch)
+        except BaseException:
+            if self.metric_registry is not None:
+                batch.results = dict.fromkeys(batch.keys, "failed")
+            raise
+        finally:
+            if self.metric_registry is not None:
+                batch.completed_at = time.monotonic()
+
+    def _prepare_sessions(self, batch, prefetch):
         trace_start = time.perf_counter() if self.trace_enabled else None
         keys = list(batch.keys)
         start_with_sources = getattr(
@@ -120,9 +170,25 @@ class SessionPrefetch:
                 (time.perf_counter() - trace_start) * 1000,
             )
             trace_start = time.perf_counter()
+        if self.metric_registry is not None:
+            batch.results = {
+                key: (
+                    "failed"
+                    if result != 0 or (prefetch and source in ("dfs", "unknown"))
+                    else "no_prefetch_needed"
+                    if prefetch
+                    else "session_only"
+                )
+                for key, result, source in zip(keys, results, sources)
+            }
         if prefetch and good:
             try:
                 copied = list(self.store.batch_get_session_prefetch(good))
+                if self.metric_registry is not None and len(copied) == len(good):
+                    batch.results.update(
+                        (key, "prefetched" if result == 0 else "failed")
+                        for key, result in zip(good, copied)
+                    )
                 with self.lock:
                     self.stats["prefetched_keys"] += sum(x == 0 for x in copied)
                     self.stats["prefetch_failed_keys"] += len(good) - sum(
@@ -165,22 +231,81 @@ class SessionPrefetch:
         keys = tuple(dict.fromkeys(keys))
         with self.lock:
             previous = self.requests.get(rid)
-            if previous is not None and keys == tuple(k for k, _ in previous):
+            if previous is not None and keys == tuple(k for k, _ in previous.owners):
+                self.stats["reused_requests"] += 1
                 return True
             self.release(rid)
             if self.closed or not keys or len(self.requests) >= self.max_requests:
                 self.stats["not_admitted"] += 1
+                reason = "closed" if self.closed else "empty" if not keys else "limit"
+                self.stats[f"rejected_{reason}"] += 1
                 return False
-            self.requests[rid] = self._retain(keys, True)
+            submitted_at = (
+                time.monotonic() if self.metric_registry is not None else None
+            )
+            request = _Request(self._retain(keys, True), submitted_at)
+            self.requests[rid] = request
             self.stats["submitted"] += 1
             return True
 
+    def _observe_request(self, request):
+        with self.lock:
+            if request.submitted_at is None or request.result is not None:
+                return
+            batches = {batch for _, batch in request.owners}
+            if not all(batch.future.done() for batch in batches):
+                return
+            # Only this request's keys determine its outcome in a shared batch.
+            results = {
+                batch.results.get(key, "failed") for key, batch in request.owners
+            }
+            if "failed" in results:
+                result = "failed"
+            elif "session_only" in results:
+                result = "session_only"
+            elif "prefetched" in results:
+                result = "prefetched"
+            else:
+                result = "no_prefetch_needed"
+            request.result = result
+            # A new owner may reuse a batch that finished before it was admitted.
+            request.ready_at = max(
+                request.submitted_at, max(batch.completed_at for batch in batches)
+            )
+            self.duration.labels(result=result).observe(
+                request.ready_at - request.submitted_at
+            )
+
+    def claim(self, rid):
+        """Record the first load-worker claim, not successful device consumption."""
+        with self.lock:
+            request = self.requests.get(rid)
+            if request is None or request.submitted_at is None or request.claimed:
+                return
+            self._observe_request(request)
+            request.claimed = True
+            self.stats["claimed"] += 1
+            if request.result == "prefetched":
+                self.ready_lead.observe(time.monotonic() - request.ready_at)
+            else:
+                self.stats["claimed_without_ready_prefetch"] += 1
+
     def release(self, rid):
         with self.lock:
-            owners = self.requests.pop(rid, [])
-            if owners:
-                self.stats["released_requests"] += 1
-            self._release(owners)
+            request = self.requests.pop(rid, None)
+            if request is None:
+                return
+            self.stats["released_requests"] += 1
+            self._observe_request(request)
+            if request.submitted_at is not None:
+                if request.result is None:
+                    request.result = "cancelled"
+                    self.duration.labels(result="cancelled").observe(
+                        time.monotonic() - request.submitted_at
+                    )
+                elif not request.claimed and request.result == "prefetched":
+                    self.stats["discarded_ready"] += 1
+            self._release(request.owners)
 
     def _release(self, owners):
         batches = set()
@@ -309,10 +434,19 @@ class SessionPrefetch:
 
     def metrics(self):
         with self.lock:
+            for request in self.requests.values():
+                self._observe_request(request)
+            ready = sum(
+                request.result == "prefetched" and not request.claimed
+                for request in self.requests.values()
+            )
             lines = [
-                "# HELP mooncake_direct_prefetch_waiting_requests Waiting requests retaining native sessions",
+                "# HELP mooncake_direct_prefetch_waiting_requests Waiting/loading requests retaining native sessions",
                 "# TYPE mooncake_direct_prefetch_waiting_requests gauge",
                 f"mooncake_direct_prefetch_waiting_requests {len(self.requests)}",
+                "# HELP mooncake_direct_prefetch_ready_requests Unclaimed requests with completed native prefetch",
+                "# TYPE mooncake_direct_prefetch_ready_requests gauge",
+                f"mooncake_direct_prefetch_ready_requests {ready}",
                 "# HELP mooncake_direct_prefetch_events_total Session admission and API results, not DFS-consumption bytes",
                 "# TYPE mooncake_direct_prefetch_events_total counter",
             ]
@@ -320,7 +454,12 @@ class SessionPrefetch:
                 f'mooncake_direct_prefetch_events_total{{event="{name}"}} {value}'
                 for name, value in sorted(self.stats.items())
             )
-            return "\n".join(lines) + "\n"
+            text = "\n".join(lines) + "\n"
+            if self.metric_registry is not None:
+                from prometheus_client import generate_latest
+
+                text += generate_latest(self.metric_registry).decode()
+            return text
 
     def close(self):
         with self.lock:
