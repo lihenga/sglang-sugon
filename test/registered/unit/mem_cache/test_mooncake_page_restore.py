@@ -1,7 +1,7 @@
 import ctypes
 import threading
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -19,6 +19,9 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     _local_buffer_size,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import LayerWiseLoadCounter
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class HostStore:
@@ -57,6 +60,7 @@ def make_linker(page_wise):
         rows_are_pages=True,
     )
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.trace_enabled = False
     linker.pools = {PoolName.KV: pool}
     linker.num_layers = 3
     linker.page_wise_load = page_wise
@@ -92,6 +96,36 @@ def test_page_and_layer_reads_restore_noncontiguous_destinations(page_wise):
         assert not buf[2].any()
     assert linker.storage.store.reads == (1 if page_wise else 3)
     assert linker.storage.store.started == linker.storage.store.ended
+
+
+@pytest.mark.parametrize("code", [-1607, -1608])
+@pytest.mark.parametrize("read_plan", [False, True])
+def test_linker_reports_only_dfs_data_timeouts(read_plan, code):
+    linker, _, _ = make_linker(False)
+    linker.storage._dfs_health_manager = manager = Mock()
+    native = linker.storage.store
+    linker.read_plan_enabled = read_plan
+    counter = linker.layer_done_counter.update_producer()
+    if read_plan:
+        plan = Mock()
+        plan.run.side_effect = RuntimeError(
+            f"Mooncake read plan range get failed rc={code}"
+        )
+        native.create_read_plan = Mock(return_value=plan)
+        operation = lambda: linker._read_batches(
+            counter, {PoolName.KV: (["p0"], [0])}, [], True
+        )
+    else:
+        native.batch_get_into_multi_buffer_ranges = Mock(return_value=[code])
+        operation = lambda: linker._read_ranges(
+            PoolName.KV, ["p0"], ([[0]], [[1]], [[0]])
+        )
+    with pytest.raises(RuntimeError):
+        operation()
+    if code == -1607:
+        manager.report_operation_timeout.assert_called_once_with("read", code)
+    else:
+        manager.report_operation_timeout.assert_not_called()
 
 
 def test_partial_start_failure_ends_successful_sessions():

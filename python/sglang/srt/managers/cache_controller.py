@@ -597,6 +597,12 @@ class HiCacheController:
                 "Cannot attach storage backend: previous detach did not stop storage threads cleanly."
             ) from e
 
+        previous = getattr(self, "storage_backend", None)
+        if previous is not None:
+            # A failed health-manager close retains native work and its client.
+            previous.close()
+            self.storage_backend = None
+
         # Rollback-safe init: if creation fails, keep controller state consistent
         # for future attach attempts.
         self.storage_backend_type = storage_backend
@@ -679,6 +685,7 @@ class HiCacheController:
             self._destroy_sync_groups(self.prefetch_completion_sync_groups)
             self.prefetch_hits_sync_groups = []
             self.prefetch_completion_sync_groups = []
+            closed = True
             try:
                 if (
                     hasattr(self, "storage_backend")
@@ -687,8 +694,10 @@ class HiCacheController:
                     if hasattr(self.storage_backend, "close"):
                         self.storage_backend.close()
             except Exception:
-                pass
-            self.storage_backend = None
+                closed = False
+                logger.exception("Retaining storage backend until native work drains.")
+            if closed:
+                self.storage_backend = None
             self.storage_backend_type = None
             self.enable_storage = False
             self.page_get_func = self._generic_page_get
@@ -715,23 +724,17 @@ class HiCacheController:
             # to avoid flipping `enable_storage` flags while threads are still alive.
             raise RuntimeError("Stop storage threads failed; detach aborted.") from e
 
-        # Best-effort destroy process groups created for storage ops.
+        # Stopped workers must not receive new work, even if close needs a retry.
+        self.enable_storage = False
+        # A failed close must retain the owner of pending native health calls.
+        if self.storage_backend is not None and hasattr(self.storage_backend, "close"):
+            self.storage_backend.close()
+
         self._destroy_sync_groups(
             self.prefetch_hits_sync_groups + self.prefetch_completion_sync_groups
         )
         self.prefetch_hits_sync_groups = []
         self.prefetch_completion_sync_groups = []
-
-        # Best-effort close (some backends rely on GC/destructor).
-        try:
-            if (
-                hasattr(self, "storage_backend")
-                and self.storage_backend is not None
-                and hasattr(self.storage_backend, "close")
-            ):
-                self.storage_backend.close()
-        except Exception:
-            logger.exception("Failed to close storage backend cleanly.")
 
         self.storage_backend = None
         self.storage_backend_type = None

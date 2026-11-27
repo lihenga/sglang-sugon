@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import threading
 import time
 from contextlib import nullcontext
@@ -21,6 +22,9 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolGroup,
     resolve_hybrid_device_pool_group,
+)
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+    DFS_BATCH_GET_TIMEOUT,
 )
 from sglang.srt.mem_cache.storage.mooncake_store.session_prefetch import (
     SessionPrefetch,
@@ -177,6 +181,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         rank_replicated = self.pool_group.rank_replicated
         self.offload_owner = not rank_replicated or tp_rank == 0
         extra_config = deepcopy(extra_config or {})
+        from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+            resolve_dfs_health_config,
+        )
+
+        extra_config["_mooncake_dfs_health_config"] = resolve_dfs_health_config(
+            extra_config.get("_mooncake_dfs_health_config"), server_args=server_args
+        )
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
         # storage keys, so it waits for a storage-key format change.
@@ -614,7 +625,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     (time.perf_counter() - trace_start) * 1000,
                 )
                 trace_start = time.perf_counter()
-            plan.run()
+            try:
+                plan.run()
+            except RuntimeError as error:
+                result = re.search(r"\brc=(-?\d+)\b", str(error))
+                if result and int(result[1]) == DFS_BATCH_GET_TIMEOUT:
+                    self.storage._report_dfs_operation_timeout(
+                        "read", DFS_BATCH_GET_TIMEOUT
+                    )
+                raise
             if trace_start is not None:
                 logger.info(
                     "Mooncake linker trace: stage=plan_run batch=%d ms=%.3f",
@@ -657,6 +676,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         expected = [sum(parts) for parts in sizes]
         if result is None or isinstance(result, int) or list(result) != expected:
+            if isinstance(result, (list, tuple)) and DFS_BATCH_GET_TIMEOUT in result:
+                self.storage._report_dfs_operation_timeout(
+                    "read", DFS_BATCH_GET_TIMEOUT
+                )
             raise RuntimeError(
                 f"Mooncake range get failed for pool={name}: transferred={result}, expected={expected}"
             )
@@ -712,6 +735,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def pop_completed_offload(self) -> bool:
         return self.offload_results.get_nowait()
+
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        return self.storage.get_local_dfs_health_policy()
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        self.storage.apply_dfs_health_policy(allow_read, allow_write)
 
     def reset(self) -> None:
         self.pending_loads.clear()

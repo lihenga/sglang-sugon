@@ -128,6 +128,17 @@ class StorageAttachment:
             ) = HybridCacheController.parse_storage_backend_extra_config(
                 storage_backend_extra_config_json
             )
+            if storage_backend == "mooncake":
+                from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+                    resolve_dfs_health_config,
+                )
+                from sglang.srt.runtime_context import get_memory
+
+                extra_config = dict(extra_config or {})
+                extra_config["_mooncake_dfs_health_config"] = resolve_dfs_health_config(
+                    extra_config.get("_mooncake_dfs_health_config"),
+                    server_args=get_memory(),
+                )
         except Exception as e:
             logger.exception(f"Failed to parse storage_backend_extra_config_json: {e}")
             return (
@@ -215,9 +226,12 @@ class StorageAttachment:
             controller.detach_storage_backend()
         except Exception as e:
             logger.exception("Failed to detach storage backend.")
-            # Never crash the server for an admin operation. The controller raises
-            # while its threads are still alive, so leave `ongoing_*` untouched --
-            # a retry must still be able to match their acks.
+            if not controller.enable_storage:
+                # Health close can fail after workers stopped. Keep its owner
+                # for retry, but never enqueue storage work on stopped workers.
+                cache.enable_storage = False
+                cache.enable_storage_metrics = False
+            # Keep ongoing bookkeeping intact for a later detach retry.
             return False, f"Failed to detach HiCache storage backend: {e}"
 
         try:
