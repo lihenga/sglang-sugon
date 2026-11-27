@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 import threading
 from collections import Counter
 from types import SimpleNamespace
@@ -173,6 +176,198 @@ def test_request_limit_and_repeated_lookup_do_not_leak_refs():
         manager.close()
 
 
+def samples(manager):
+    from prometheus_client.parser import text_string_to_metric_families
+
+    return {
+        (sample.name, tuple(sorted(sample.labels.items()))): sample.value
+        for family in text_string_to_metric_families(manager.metrics())
+        for sample in family.samples
+    }
+
+
+def test_prefetch_metrics_count_reuse_claim_and_ready_lead_once(clock):
+    manager = SessionPrefetch(Store(), enable_metrics=True)
+    try:
+        prepare(manager)
+        clock.now += 2
+        assert manager.submit("waiting", ["page"])
+        manager.claim("waiting")
+        manager.claim("waiting")
+        manager.release("waiting")
+        metric = samples(manager)
+        prefix = "mooncake_direct_prefetch_"
+        assert metric[prefix + "events_total", (("event", "submitted"),)] == 1
+        assert metric[prefix + "events_total", (("event", "reused_requests"),)] == 1
+        assert metric[prefix + "events_total", (("event", "claimed"),)] == 1
+        assert metric[prefix + "ready_lead_seconds_count", ()] == 1
+        assert metric[prefix + "ready_lead_seconds_sum", ()] == 2
+        assert (
+            metric[prefix + "duration_seconds_count", (("result", "prefetched"),)] == 1
+        )
+        assert manager.stats["discarded_ready"] == 0
+    finally:
+        manager.close()
+
+
+def test_prefetch_metrics_cancel_inflight_once_and_keep_ownership():
+    store = Store()
+    store.proceed.clear()
+    manager = SessionPrefetch(store, enable_metrics=True)
+    try:
+        manager.submit("waiting", ["page"])
+        assert store.entered.wait(5)
+        manager.release("waiting")
+        assert not store.ended
+        store.proceed.set()
+        manager.reset()
+        metric = samples(manager)
+        prefix = "mooncake_direct_prefetch_duration_seconds_count"
+        assert metric[prefix, (("result", "cancelled"),)] == 1
+        assert (prefix, (("result", "prefetched"),)) not in metric
+        assert store.ended["page"] == 1
+    finally:
+        store.proceed.set()
+        manager.close()
+
+
+def test_prefetch_metrics_shared_ready_requests_release_independently():
+    store = Store()
+    manager = SessionPrefetch(store, enable_metrics=True)
+    try:
+        prepare(manager, "first")
+        prepare(manager, "second")
+        assert samples(manager)["mooncake_direct_prefetch_ready_requests", ()] == 2
+        manager.release("first")
+        assert not store.ended
+        manager.claim("second")
+        manager.release("second")
+        assert manager.stats["discarded_ready"] == 1
+        assert manager.stats["claimed"] == 1
+        assert store.started["page"] == store.ended["page"] == 1
+    finally:
+        manager.close()
+
+
+def test_shared_batch_failure_does_not_mark_an_unaffected_request_failed():
+    store = Store()
+    store.partial_start = True
+    manager = SessionPrefetch(store, enable_metrics=True)
+    try:
+        prepare(manager, "mixed", ("bad", "good"))
+        prepare(manager, "good-only", ("good",))
+        metric = samples(manager)
+        prefix = "mooncake_direct_prefetch_duration_seconds_count"
+        assert metric[prefix, (("result", "failed"),)] == 1
+        assert metric[prefix, (("result", "prefetched"),)] == 1
+        manager.claim("good-only")
+        assert manager.stats["claimed_without_ready_prefetch"] == 0
+    finally:
+        manager.close()
+
+
+def test_prefetch_request_borrowing_demand_session_is_not_prefetched():
+    manager = SessionPrefetch(Store(), enable_metrics=True)
+    try:
+        with manager.acquire(["page"]):
+            prepare(manager)
+            manager.claim("waiting")
+            metric = samples(manager)
+            assert (
+                metric[
+                    "mooncake_direct_prefetch_duration_seconds_count",
+                    (("result", "session_only"),),
+                ]
+                == 1
+            )
+            assert metric["mooncake_direct_prefetch_ready_lead_seconds_count", ()] == 0
+            manager.release("waiting")
+    finally:
+        manager.close()
+
+
+def test_prefetch_metrics_claim_before_ready_does_not_invent_lead():
+    store = Store()
+    store.proceed.clear()
+    manager = SessionPrefetch(store, enable_metrics=True)
+    try:
+        manager.submit("waiting", ["page"])
+        assert store.entered.wait(5)
+        manager.claim("waiting")
+        store.proceed.set()
+        with manager.acquire(["page"]):
+            pass
+        manager.release("waiting")
+        assert manager.stats["claimed_without_ready_prefetch"] == 1
+        assert (
+            samples(manager)["mooncake_direct_prefetch_ready_lead_seconds_count", ()]
+            == 0
+        )
+        assert manager.stats["discarded_ready"] == 0
+    finally:
+        store.proceed.set()
+        manager.close()
+
+
+@pytest.mark.parametrize("failure", ["exception", "return_code", "session_start"])
+def test_prefetch_metrics_failures_are_distinct_from_admission_rejection(failure):
+    class FailedStore(Store):
+        def batch_get_session_prefetch(self, keys):
+            if failure == "return_code":
+                return [-1] * len(keys)
+            return super().batch_get_session_prefetch(keys)
+
+    store = FailedStore()
+    store.fail_prefetch = failure == "exception"
+    store.partial_start = failure == "session_start"
+    manager = SessionPrefetch(store, enable_metrics=True, max_requests=1)
+    try:
+        prepare(manager, keys=("bad",))
+        assert not manager.submit("rejected", ["other"])
+        assert manager.stats["rejected_limit"] == 1
+        assert (
+            samples(manager)[
+                "mooncake_direct_prefetch_duration_seconds_count",
+                (("result", "failed"),),
+            ]
+            == 1
+        )
+        if failure != "session_start":
+            with manager.acquire(["bad"]):
+                pass  # Failed speculative reads still allow the normal load.
+    finally:
+        manager.close()
+
+
+def test_prefetch_metrics_reset_records_pending_cancellation(monkeypatch):
+    store = Store()
+    store.proceed.clear()
+    manager = SessionPrefetch(store, enable_metrics=True)
+    try:
+        manager.submit("waiting", ["page"])
+        assert store.entered.wait(5)
+        release = manager.release
+
+        def release_and_unblock(rid):
+            release(rid)
+            store.proceed.set()
+
+        monkeypatch.setattr(manager, "release", release_and_unblock)
+        manager.reset()
+        manager.reset()
+        assert (
+            samples(manager)[
+                "mooncake_direct_prefetch_duration_seconds_count",
+                (("result", "cancelled"),),
+            ]
+            == 1
+        )
+        assert samples(manager)["mooncake_direct_prefetch_waiting_requests", ()] == 0
+    finally:
+        store.proceed.set()
+        manager.close()
+
+
 def test_memory_only_session_does_not_issue_dfs_prefetch():
     class MemoryStore(Store):
         def batch_get_session_start_with_sources(self, keys):
@@ -186,6 +381,30 @@ def test_memory_only_session_does_not_issue_dfs_prefetch():
             assert not store.entered.is_set()
         manager.release("a")
         assert store.ended["page"] == 1
+    finally:
+        manager.close()
+
+
+def test_memory_only_prefetch_metrics_do_not_count_dfs_readiness():
+    class MemoryStore(Store):
+        def batch_get_session_start_with_sources(self, keys):
+            return self.batch_get_session_start(keys), ["memory"] * len(keys)
+
+    manager = SessionPrefetch(MemoryStore(), enable_metrics=True)
+    try:
+        prepare(manager)
+        manager.claim("waiting")
+        manager.release("waiting")
+        metric = samples(manager)
+        assert (
+            metric[
+                "mooncake_direct_prefetch_duration_seconds_count",
+                (("result", "no_prefetch_needed"),),
+            ]
+            == 1
+        )
+        assert metric["mooncake_direct_prefetch_ready_lead_seconds_count", ()] == 0
+        assert manager.stats["discarded_ready"] == 0
     finally:
         manager.close()
 
@@ -540,6 +759,61 @@ def test_refresh_skip_configuration_guards_ttl_and_groups(monkeypatch):
     assert session_refresh_age_from_env() == 0
     monkeypatch.setenv("SGLANG_MOONCAKE_LEASE_TTL_S", "4")
     assert session_refresh_age_from_env() == 0
+
+
+def test_snapshot_histograms_do_not_also_export_from_multiprocess(tmp_path):
+    # Prometheus chooses mmap storage at import, so this must be a fresh process.
+    script = """
+import os
+from types import SimpleNamespace
+from prometheus_client import CollectorRegistry, generate_latest, multiprocess
+from prometheus_client.parser import text_string_to_metric_families
+from sglang.srt.mem_cache.storage.mooncake_store.session_prefetch import SessionPrefetch
+from sglang.srt.observability.mooncake_client_metrics import MooncakeClientCollector, receive_snapshot
+
+store = SimpleNamespace(
+    batch_get_session_start=lambda keys: [0] * len(keys),
+    batch_get_session_prefetch=lambda keys: [0] * len(keys),
+    batch_get_session_end=lambda keys: 0,
+)
+manager = SessionPrefetch(store, enable_metrics=True)
+try:
+    manager.submit("request", ["key"])
+    manager.keys["key"].future.result(timeout=5)
+    manager.claim("request")
+    receive_snapshot({
+        "client_id": "a" * 32, "sequence": 1, "metrics": manager.metrics(),
+        "labels": {"mooncake_client": "a" * 32, "mooncake_host": "test",
+                   "mooncake_pid": str(os.getpid()), "mooncake_rank": "0"},
+    })
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    assert b"mooncake_direct_prefetch" not in generate_latest(registry)
+    registry.register(MooncakeClientCollector())
+    families = list(text_string_to_metric_families(generate_latest(registry).decode()))
+    for name in ("duration_seconds", "ready_lead_seconds"):
+        buckets = [s for f in families for s in f.samples
+                   if s.name == "mooncake_direct_prefetch_" + name + "_bucket"]
+        assert {s.labels["le"] for s in buckets} == {
+            "0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1.0",
+            "5.0", "10.0", "30.0", "60.0", "300.0", "+Inf"}
+        counts = [s for f in families for s in f.samples
+                  if s.name == "mooncake_direct_prefetch_" + name + "_count"]
+        assert len(counts) == 1, counts
+        assert counts[0].value == 1, counts
+        assert counts[0].labels["mooncake_client"] == "a" * 32
+finally:
+    manager.close()
+"""
+    env = {**os.environ, "PROMETHEUS_MULTIPROC_DIR": str(tmp_path)}
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 if __name__ == "__main__":

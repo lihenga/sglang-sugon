@@ -483,6 +483,70 @@ python -m sglang_router.launch_router \
     --port 8000
 ```
 
+## Direct-linker waiting-queue prefetch metrics
+
+Enable `--enable-metrics` and `--mooncake-enable-waiting-queue-dfs-prefetch`
+with a Mooncake package that supports `get_client_metrics()`. The embedded
+client reporter forwards these metrics to the existing SGLang `/metrics`
+endpoint every approximately five seconds. No extra scrape port is required.
+Snapshots carry `mooncake_client`, `mooncake_host`, `mooncake_pid`, and
+`mooncake_rank`; use `sglang:mooncake_client_up` to check snapshot freshness.
+These metrics use the `mooncake_` namespace because that is the reporter's
+accepted namespace; they are not exported through Master service aggregation.
+
+| Metric | Meaning |
+| --- | --- |
+| `mooncake_direct_prefetch_waiting_requests` | Admitted requests retaining sessions, including requests already claimed by the load worker. |
+| `mooncake_direct_prefetch_ready_requests` | Unclaimed requests whose native prefetch completed successfully. |
+| `mooncake_direct_prefetch_events_total{event}` | Admission, reuse, first load-worker claim, release, and native API/key counters. Select explicit events; do not sum every event as a request total. |
+| `mooncake_direct_prefetch_duration_seconds{result}` | Per admitted request: admission to preparation completion, or to cancellation before preparation completes. Includes executor queueing, session startup, and speculative native prefetch. |
+| `mooncake_direct_prefetch_ready_lead_seconds` | Preparation completion to first load-worker claim, only for requests already prefetched when claimed. |
+
+Request lifecycle events are `submitted`, `claimed`, `discarded_ready`, and
+`claimed_without_ready_prefetch`. Repeated lookup of the same request and key
+set increments `reused_requests`, not `submitted`. Admission rejection increments
+`not_admitted` and one of `rejected_limit`, `rejected_empty`, or `rejected_closed`;
+it is distinct from native arena/read failures (`prefetch_failed_keys` or
+`prefetch_errors`). `discarded_ready` counts an unclaimed, successfully prepared
+request released by cancellation, replacement, or reset. A shared batch is
+still retained until its final owner releases it.
+
+Duration results are:
+
+- `prefetched`: all sessions and requested native prefetch calls succeeded.
+  Older native APIs may report an unknown source, so this is not proof of
+  physical DFS bytes or later successful GPU consumption.
+- `no_prefetch_needed`: all sessions succeeded and their reported sources did
+  not need a DFS prefetch call (for example, memory-only hits).
+- `session_only`: at least one batch was originally opened by a demand load,
+  without a speculative prefetch call; it is not counted as prefetched.
+- `failed`: session startup, native prefetch, or any key result failed. A
+  speculative read failure still permits the existing normal-read fallback.
+- `cancelled`: the request released its speculative ownership before preparation
+  completed. Native work may continue; its eventual completion is not counted
+  as a second request outcome. A cancellation after preparation retains the
+  recorded result and may increment `discarded_ready` instead.
+
+Claim is recorded when the load worker starts processing the request after its
+device-ready event, before session acquisition and device copies. It does not
+mean that GPU restore succeeded. Claims without a completed successful prefetch
+increment `claimed_without_ready_prefetch` and do not add a zero lead sample.
+Evaluate this count alongside the lead histogram to avoid observing only the
+ready subset. A shared batch completed before a new request was admitted is
+treated as immediately ready for that request, with zero preparation duration.
+
+All request counts are **per reporting client/rank**, not deduplicated model
+requests: TP/CP/PP workers may report the same logical request, and MLA broadcast
+peers may not run a native prefetch. Do not describe their sum as a DP replica
+count or end-to-end cache hit rate. Request IDs are never metric labels. The
+session-based implementation has no legacy forward-ingress background queue,
+so it does not emit `sglang:waiting_queue_prefetch_scheduler_events_total`.
+Use explicit admission/reuse/rejection events for its queue diagnostics.
+Histograms use process-local buckets and a private collector registry only when
+the embedded reporter is enabled. They never write Prometheus multiprocess mmap
+files, so the HTTP multiprocess collector cannot export a second unlabeled copy;
+metrics do not change native session ownership, admission, or read fallback.
+
 ## Troubleshooting
 
 **RDMA Registration Failure:**
