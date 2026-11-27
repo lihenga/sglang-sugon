@@ -542,7 +542,9 @@ count or end-to-end cache hit rate. Request IDs are never metric labels. The
 session-based implementation has no legacy forward-ingress background queue,
 so it does not emit `sglang:waiting_queue_prefetch_scheduler_events_total`.
 Use explicit admission/reuse/rejection events for its queue diagnostics.
-Histograms use a private registry only when the embedded reporter is enabled;
+Histograms use process-local buckets and a private collector registry only when
+the embedded reporter is enabled. They never write Prometheus multiprocess mmap
+files, so the HTTP multiprocess collector cannot export a second unlabeled copy;
 metrics do not change native session ownership, admission, or read fallback.
 
 ## Troubleshooting

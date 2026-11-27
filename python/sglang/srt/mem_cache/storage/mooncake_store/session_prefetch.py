@@ -58,6 +58,54 @@ class _Request:
     ready_at: float = 0.0
 
 
+class _SnapshotHistogram:
+    """Process-local buckets: Prometheus Histogram would also write mmap files."""
+
+    def __init__(self, name, documentation, *, labelled=False):
+        self.name = name
+        self.documentation = documentation
+        self.labelled = labelled
+        self.bounds = (
+            0.001,
+            0.005,
+            0.01,
+            0.05,
+            0.1,
+            0.5,
+            1,
+            5,
+            10,
+            30,
+            60,
+            300,
+            math.inf,
+        )
+        self.samples = {} if labelled else {None: [0.0, [0] * len(self.bounds)]}
+
+    def observe(self, value, result=None):
+        sample = self.samples.setdefault(result, [0.0, [0] * len(self.bounds)])
+        sample[0] += value
+        for index, bound in enumerate(self.bounds):
+            sample[1][index] += value <= bound
+
+    def collect(self):
+        from prometheus_client.core import HistogramMetricFamily
+
+        family = HistogramMetricFamily(
+            self.name, self.documentation, labels=["result"] if self.labelled else []
+        )
+        for result, (total, counts) in self.samples.items():
+            family.add_metric(
+                [result] if self.labelled else [],
+                [
+                    ("+Inf" if math.isinf(bound) else str(float(bound)), count)
+                    for bound, count in zip(self.bounds, counts)
+                ],
+                total,
+            )
+        yield family
+
+
 class SessionPrefetch:
     """Keep native sessions alive until all waiting and loading users release.
 
@@ -99,24 +147,21 @@ class SessionPrefetch:
         self.stats = Counter()
         self.metric_registry = None
         if enable_metrics:
-            from prometheus_client import CollectorRegistry, Histogram
+            from prometheus_client import CollectorRegistry
 
             # Export through the existing client snapshot, not the worker registry.
             self.metric_registry = CollectorRegistry()
-            buckets = (0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 300)
-            self.duration = Histogram(
+            self.duration = _SnapshotHistogram(
                 "mooncake_direct_prefetch_duration_seconds",
                 "Request admission to session/prefetch preparation or cancellation",
-                ("result",),
-                buckets=buckets,
-                registry=self.metric_registry,
+                labelled=True,
             )
-            self.ready_lead = Histogram(
+            self.ready_lead = _SnapshotHistogram(
                 "mooncake_direct_prefetch_ready_lead_seconds",
                 "Completed native prefetch to load-worker claim; excludes unready claims",
-                buckets=buckets,
-                registry=self.metric_registry,
             )
+            self.metric_registry.register(self.duration)
+            self.metric_registry.register(self.ready_lead)
 
     def _prepare(self, batch, prefetch):
         try:
@@ -272,8 +317,8 @@ class SessionPrefetch:
             request.ready_at = max(
                 request.submitted_at, max(batch.completed_at for batch in batches)
             )
-            self.duration.labels(result=result).observe(
-                request.ready_at - request.submitted_at
+            self.duration.observe(
+                request.ready_at - request.submitted_at, result=result
             )
 
     def claim(self, rid):
@@ -300,8 +345,8 @@ class SessionPrefetch:
             if request.submitted_at is not None:
                 if request.result is None:
                     request.result = "cancelled"
-                    self.duration.labels(result="cancelled").observe(
-                        time.monotonic() - request.submitted_at
+                    self.duration.observe(
+                        time.monotonic() - request.submitted_at, result="cancelled"
                     )
                 elif not request.claimed and request.result == "prefetched":
                     self.stats["discarded_ready"] += 1

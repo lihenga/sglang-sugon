@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 import threading
 from collections import Counter
 from types import SimpleNamespace
@@ -756,6 +759,61 @@ def test_refresh_skip_configuration_guards_ttl_and_groups(monkeypatch):
     assert session_refresh_age_from_env() == 0
     monkeypatch.setenv("SGLANG_MOONCAKE_LEASE_TTL_S", "4")
     assert session_refresh_age_from_env() == 0
+
+
+def test_snapshot_histograms_do_not_also_export_from_multiprocess(tmp_path):
+    # Prometheus chooses mmap storage at import, so this must be a fresh process.
+    script = """
+import os
+from types import SimpleNamespace
+from prometheus_client import CollectorRegistry, generate_latest, multiprocess
+from prometheus_client.parser import text_string_to_metric_families
+from sglang.srt.mem_cache.storage.mooncake_store.session_prefetch import SessionPrefetch
+from sglang.srt.observability.mooncake_client_metrics import MooncakeClientCollector, receive_snapshot
+
+store = SimpleNamespace(
+    batch_get_session_start=lambda keys: [0] * len(keys),
+    batch_get_session_prefetch=lambda keys: [0] * len(keys),
+    batch_get_session_end=lambda keys: 0,
+)
+manager = SessionPrefetch(store, enable_metrics=True)
+try:
+    manager.submit("request", ["key"])
+    manager.keys["key"].future.result(timeout=5)
+    manager.claim("request")
+    receive_snapshot({
+        "client_id": "a" * 32, "sequence": 1, "metrics": manager.metrics(),
+        "labels": {"mooncake_client": "a" * 32, "mooncake_host": "test",
+                   "mooncake_pid": str(os.getpid()), "mooncake_rank": "0"},
+    })
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    assert b"mooncake_direct_prefetch" not in generate_latest(registry)
+    registry.register(MooncakeClientCollector())
+    families = list(text_string_to_metric_families(generate_latest(registry).decode()))
+    for name in ("duration_seconds", "ready_lead_seconds"):
+        buckets = [s for f in families for s in f.samples
+                   if s.name == "mooncake_direct_prefetch_" + name + "_bucket"]
+        assert {s.labels["le"] for s in buckets} == {
+            "0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1.0",
+            "5.0", "10.0", "30.0", "60.0", "300.0", "+Inf"}
+        counts = [s for f in families for s in f.samples
+                  if s.name == "mooncake_direct_prefetch_" + name + "_count"]
+        assert len(counts) == 1, counts
+        assert counts[0].value == 1, counts
+        assert counts[0].labels["mooncake_client"] == "a" * 32
+finally:
+    manager.close()
+"""
+    env = {**os.environ, "PROMETHEUS_MULTIPROC_DIR": str(tmp_path)}
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 if __name__ == "__main__":
