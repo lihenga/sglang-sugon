@@ -50,7 +50,7 @@ entering the waiting queue (or PD prefill bootstrap queue) probe the prefix and
 submit native session prefetch when a hit and available prefetch quota permit.
 This early lookup requires PP=1, normal serving or PD prefill, and agreement
 across all ranks. Session and pre-aborted requests skip the early lookup. For supported
-non-overlap configurations, the scheduler also receives ordinary text generation
+configurations, the scheduler also receives ordinary text generation
 requests while the current model forward runs on a dedicated thread. Device KV
 allocation and request admission still happen at the normal scheduling boundary.
 
@@ -61,13 +61,18 @@ to A/B forward-time reception while keeping waiting-queue prefetch enabled:
 export SGLANG_MOONCAKE_FORWARD_INGRESS=0  # 1 to enable
 ```
 
-Forward-time reception requires the Mooncake direct linker, native session
-prefetch, FCFS, PP=1, and normal serving or PD prefill on CUDA or CPU. It is
-disabled with overlap scheduling, speculative decoding, PD multiplexing, KV
+Forward-time reception supports both overlap and non-overlap scheduling, including
+DSPARK with overlap enabled (for example TP8/DCP8 Kimi-K3). It requires the
+Mooncake direct linker, native session prefetch, FCFS, PP=1, and normal serving
+or PD prefill on CUDA or CPU. It is disabled with speculative algorithms other
+than DSPARK, PD multiplexing, KV
 canary, encoder receivers, colocated input blocking, or scripted runtime hooks.
 All ranks agree on the switch at startup; an ineligible rank disables it for
 the whole instance. Control, multimodal, session, LoRA, beam, embedding-override,
 and constrained-generation requests replay in order after forward completes.
+DSPARK publication stays on the model thread; its grammar barrier runs on the
+scheduler thread. Overlap retains its existing result queue, sampling, and WAR
+barrier without adding a whole-forward GPU wait to the scheduler stream.
 
 ## Install Mooncake
 

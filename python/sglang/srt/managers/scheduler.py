@@ -24,10 +24,12 @@ import sys
 import time
 from array import array
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
+from queue import Empty, SimpleQueue
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.runtime_context import (
@@ -2506,9 +2508,8 @@ class Scheduler(
         enabled = bool(
             prefetch
             and envs.SGLANG_MOONCAKE_FORWARD_INGRESS.get()
-            and not self.enable_overlap
             and not self.enable_pdmux
-            and self.spec_algorithm.is_none()
+            and (self.spec_algorithm.is_none() or self.spec_algorithm.is_dspark())
             and self.schedule_policy == "fcfs"
             and get_observability().kv_canary == "none"
             and self.device in ("cuda", "cpu")
@@ -2543,11 +2544,35 @@ class Scheduler(
             )
         tp, cp, attn_tp = groups
         self._forward_ingress_group = tp
+        # DSPARK's draft scopes temporarily narrow the process-global topology.
+        # Socket ownership and receive broadcasts must keep the target topology.
+        parallel = get_parallel()
+        receive_parallel = SimpleNamespace(
+            **{
+                name: getattr(parallel, name)
+                for name in (
+                    "pp_rank",
+                    "tp_size",
+                    "tp_group",
+                    "world_group",
+                    "attn_dp_enabled",
+                    "attn_tp_rank",
+                    "attn_cp_rank",
+                    "attn_dp_rank",
+                    "attn_cp_size",
+                    "attn_tp_size",
+                    "attn_cp_group",
+                    "attn_tp_group",
+                    "enable_dp_attention_local_control_broadcast",
+                )
+            }
+        )
         self.request_receiver = dataclasses.replace(
             self.request_receiver,
             tp_cpu_group=tp,
             attn_cp_cpu_group=cp,
             attn_tp_cpu_group=attn_tp,
+            parallel=receive_parallel,
         )
         # Forward keeps the model's CPU groups; lookup uses its own communicators.
         self.tree_cache.attn_cp_group = cp
@@ -2565,6 +2590,18 @@ class Scheduler(
         # Freeze the producer fence before ingress can enqueue more scheduler work.
         ready = self.device_module.Event()
         ready.record(self.schedule_stream)
+        callbacks = SimpleQueue()
+
+        def grammar_barrier():
+            # DSPARK may advance pending grammar mid-forward. Requests and
+            # result-queue state remain owned by the scheduler thread.
+            done = Future()
+            callbacks.put(done)
+            return done.result()
+
+        forward_kwargs = dict(kwargs)
+        if kwargs.get("grammar_barrier") is not None:
+            forward_kwargs["grammar_barrier"] = grammar_barrier
 
         def launch():
             if self.device != "cpu":
@@ -2574,7 +2611,9 @@ class Scheduler(
                 self.device_module.StreamContext(self.forward_stream),
             ):
                 self.forward_stream.wait_event(ready)
-                return self.model_worker.forward_batch_generation(batch, **kwargs)
+                return self.model_worker.forward_batch_generation(
+                    batch, **forward_kwargs
+                )
 
         future = self._forward_launch_executor.submit(
             contextvars.copy_context().run, launch
@@ -2603,6 +2642,17 @@ class Scheduler(
             )
 
         while True:
+            try:
+                callback = callbacks.get_nowait()
+            except Empty:
+                pass
+            else:
+                try:
+                    with self.device_module.StreamContext(self.forward_stream):
+                        callback.set_result(kwargs["grammar_barrier"]())
+                except BaseException as error:
+                    callback.set_exception(error)
+                    raise
             if future.done() and future.exception() is not None:
                 future.result()
             # Even a rank whose forward finished must join all receive broadcasts.
@@ -2614,28 +2664,30 @@ class Scheduler(
             )
             if not active.item():
                 break
-            recv_reqs = self.request_receiver.recv_requests()
-            for req in recv_reqs:
-                if self._deferred_input_requests:
-                    self._deferred_input_requests.append(req)
-                elif is_health_check_generate_req(req) and not self.attn_dp_enabled:
-                    self.return_health_check_ipcs.append(
-                        getattr(req, "http_worker_ipc", None)
-                    )
-                elif eligible(req):
-                    self.handle_generate_request(req)
-                elif isinstance(req, BatchTokenizedGenerateReqInput) and all(
-                    eligible(sub_req) for sub_req in req
-                ):
-                    self.handle_batch_generate_request(req)
-                else:
-                    # Control and unsupported requests replay at the next boundary.
-                    self._deferred_input_requests.append(req)
+            with self.device_module.StreamContext(self.schedule_stream):
+                recv_reqs = self.request_receiver.recv_requests()
+                for req in recv_reqs:
+                    if self._deferred_input_requests:
+                        self._deferred_input_requests.append(req)
+                    elif is_health_check_generate_req(req) and not self.attn_dp_enabled:
+                        self.return_health_check_ipcs.append(
+                            getattr(req, "http_worker_ipc", None)
+                        )
+                    elif eligible(req):
+                        self.handle_generate_request(req)
+                    elif isinstance(req, BatchTokenizedGenerateReqInput) and all(
+                        eligible(sub_req) for sub_req in req
+                    ):
+                        self.handle_batch_generate_request(req)
+                    else:
+                        # Control and unsupported requests replay at the next boundary.
+                        self._deferred_input_requests.append(req)
             if not recv_reqs:
                 time.sleep(0.01)
 
         result = future.result()
-        self.schedule_stream.wait_stream(self.forward_stream)
+        if not self.enable_overlap:
+            self.schedule_stream.wait_stream(self.forward_stream)
         return result
 
     def init_dp_attn_adapter(self) -> None:
@@ -4863,7 +4915,7 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
+                        batch_result = self._forward_with_waiting_queue_ingress(
                             batch, **fwd_kwargs
                         )
                         if batch.spec_algorithm.is_none():
@@ -4988,7 +5040,7 @@ class Scheduler(
                     # future_map relay / on_publish).
                     resolve_forward_inputs(batch, self.future_map)
                     with self._forward_isolation(batch, overlap=False):
-                        batch_result = self.model_worker.forward_batch_generation(
+                        batch_result = self._forward_with_waiting_queue_ingress(
                             batch, pp_proxy_tensors=pp_proxy_tensors
                         )
                     # The isolation restore reverted the worker's in-forward SB edits;

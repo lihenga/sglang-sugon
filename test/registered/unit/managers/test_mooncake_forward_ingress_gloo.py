@@ -63,6 +63,7 @@ def _rank(rank, rendezvous, layout):
         tp_group=tp,
         world_group=tp,
         attn_dp_enabled=cp_mode,
+        attn_dp_rank=0,
         attn_cp_group=cp,
         attn_tp_group=attn_tp,
         attn_cp_rank=cp.rank_in_group,
@@ -80,12 +81,15 @@ def _rank(rank, rendezvous, layout):
     sessions = SessionPrefetch(store)
     s = Scheduler.__new__(Scheduler)
     s.device = "cpu"
+    s.enable_overlap = layout == "cp"
     s.device_module = SimpleNamespace(Event=Mock, StreamContext=lambda _: nullcontext())
     s.forward_stream, s.schedule_stream = Mock(), Mock()
     s.is_generation = True
     s.attn_dp_enabled = cp_mode
-    s.enable_overlap = s.enable_pdmux = False
-    s.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+    s.enable_pdmux = False
+    s.spec_algorithm = SimpleNamespace(
+        is_none=lambda: not s.enable_overlap, is_dspark=lambda: s.enable_overlap
+    )
     s.schedule_policy = "fcfs"
     s.disaggregation_mode = DisaggregationMode.NULL
     s.mm_receiver = s.input_blocker = s.scripted_scheduler_hook = None
