@@ -137,6 +137,7 @@ def _rank(rank, rendezvous, layout):
             s.init_forward_ingress()
             if layout == "mixed":
                 assert not s._forward_ingress_enabled
+                assert not s._waiting_queue_prefetch_enabled
                 assert s._forward_launch_executor is None
                 return
             assert s._forward_ingress_enabled

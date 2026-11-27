@@ -333,7 +333,7 @@ def test_dspark_startup_respects_switch_with_overlap(monkeypatch, overlap, enabl
         s.init_forward_ingress()
     try:
         assert s._forward_ingress_enabled is enabled
-        assert s._waiting_queue_prefetch_enabled
+        assert s._waiting_queue_prefetch_enabled is enabled
     finally:
         if s._forward_launch_executor is not None:
             s._forward_launch_executor.shutdown(wait=True)
@@ -422,7 +422,10 @@ def test_receiver_keeps_target_topology_during_dspark_draft(monkeypatch):
 
 
 @pytest.mark.parametrize("overlap", [False, True])
-def test_run_batch_dspark_receives_before_forward_returns(monkeypatch, overlap):
+@pytest.mark.parametrize("ingress", [False, True])
+def test_run_batch_dspark_receives_before_forward_returns(
+    monkeypatch, overlap, ingress
+):
     @dataclass
     class Batch:
         sampling_info: object = None
@@ -433,6 +436,7 @@ def test_run_batch_dspark_receives_before_forward_returns(monkeypatch, overlap):
 
     s = scheduler(monkeypatch)
     s.enable_overlap = overlap
+    s._forward_ingress_enabled = ingress
     s.scheduler_stage_metrics = None
     s.metrics_reporter = Mock()
     s.forward_ct = s.processed_tokens_counter = 0
@@ -486,8 +490,12 @@ def test_run_batch_dspark_receives_before_forward_returns(monkeypatch, overlap):
         prefetched.set()
 
     def forward(batch, on_publish=None, grammar_barrier=None, **kwargs):
-        assert threading.get_ident() != owner
-        assert prefetched.wait(5)
+        if ingress:
+            assert threading.get_ident() != owner
+            assert prefetched.wait(5)
+        else:
+            assert threading.get_ident() == owner
+            assert not prefetched.is_set()
         if grammar_barrier:
             grammar_barrier()
         if on_publish:
@@ -497,6 +505,12 @@ def test_run_batch_dspark_receives_before_forward_returns(monkeypatch, overlap):
 
     s.handle_generate_request = prepare
     s.model_worker = SimpleNamespace(forward_batch_generation=forward)
+    if not ingress:
+        s._forward_with_waiting_queue_ingress = Mock(
+            side_effect=AssertionError(
+                "Disabled run_batch must call model forward directly"
+            )
+        )
     with ThreadPoolExecutor(max_workers=1) as executor:
         s._forward_launch_executor = executor
         assert s.run_batch(batch) is result
@@ -507,7 +521,22 @@ def test_run_batch_dspark_receives_before_forward_returns(monkeypatch, overlap):
         s.schedule_stream.wait_stream.assert_not_called()
     else:
         s.future_map.publish.assert_not_called()
-        s.schedule_stream.wait_stream.assert_called_once_with(s.forward_stream)
+        if ingress:
+            s.schedule_stream.wait_stream.assert_called_once_with(s.forward_stream)
+        else:
+            s.schedule_stream.wait_stream.assert_not_called()
+
+
+def test_disabled_switch_preserves_original_queue_prefetch_path(monkeypatch):
+    s = scheduler(monkeypatch)
+    s._waiting_queue_prefetch_enabled = False
+    s.enable_hicache_storage = s.enable_lmcache = False
+    s.tree_cache = SimpleNamespace(
+        linker=SimpleNamespace(cache_linker=SimpleNamespace(prefetch_enabled=True))
+    )
+    req = SimpleNamespace(session=None, to_finish=None, init_next_round_input=Mock())
+    assert s._prefetch_kvcache(req) is None
+    req.init_next_round_input.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -575,7 +604,7 @@ def test_startup_gates_do_not_create_groups(monkeypatch, disabled):
     assert not s._forward_ingress_enabled
     assert s._forward_launch_executor is None
     assert s._waiting_queue_prefetch_enabled == (
-        disabled not in ("pp", "decode", "prefetch", "peer")
+        disabled not in ("env", "pp", "decode", "prefetch", "peer")
     )
     create.assert_not_called()
 

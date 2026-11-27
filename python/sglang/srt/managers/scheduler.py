@@ -2497,7 +2497,8 @@ class Scheduler(
     def init_forward_ingress(self) -> None:
         linker = getattr(self.tree_cache, "linker", None)
         prefetch = bool(
-            linker is not None
+            envs.SGLANG_MOONCAKE_FORWARD_INGRESS.get()
+            and linker is not None
             and getattr(linker.cache_linker, "prefetch_enabled", False)
             and get_memory().unified_cache_external_linker_backend == "mooncake"
             and self.is_generation
@@ -2507,7 +2508,6 @@ class Scheduler(
         )
         enabled = bool(
             prefetch
-            and envs.SGLANG_MOONCAKE_FORWARD_INGRESS.get()
             and not self.enable_pdmux
             and (self.spec_algorithm.is_none() or self.spec_algorithm.is_dspark())
             and self.schedule_policy == "fcfs"
@@ -4869,6 +4869,11 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
+            forward_batch_generation = (
+                self._forward_with_waiting_queue_ingress
+                if self._forward_ingress_enabled
+                else self.model_worker.forward_batch_generation
+            )
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
@@ -4915,9 +4920,7 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self._forward_with_waiting_queue_ingress(
-                            batch, **fwd_kwargs
-                        )
+                        batch_result = forward_batch_generation(batch, **fwd_kwargs)
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -5040,7 +5043,7 @@ class Scheduler(
                     # future_map relay / on_publish).
                     resolve_forward_inputs(batch, self.future_map)
                     with self._forward_isolation(batch, overlap=False):
-                        batch_result = self._forward_with_waiting_queue_ingress(
+                        batch_result = forward_batch_generation(
                             batch, pp_proxy_tensors=pp_proxy_tensors
                         )
                     # The isolation restore reverted the worker's in-forward SB edits;
@@ -5081,7 +5084,7 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self._forward_with_waiting_queue_ingress(batch, **kwargs)
+                batch_result = forward_batch_generation(batch, **kwargs)
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(
