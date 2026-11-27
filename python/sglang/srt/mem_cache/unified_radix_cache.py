@@ -3661,20 +3661,24 @@ class UnifiedRadixCache(BasePrefixCache):
         return failed
 
     def _sync_dfs_health_policy(self) -> None:
-        """Apply one conservative DFS policy across attention CP/TP ranks."""
+        """Apply one conservative DFS policy across attention and PP ranks."""
+        from sglang.srt.mem_cache.storage.mooncake_store.dfs_policy import (
+            DfsHealthPolicySync,
+        )
+
         owner = self.linker
         if owner is None and self.cache_controller is not None:
             owner = self.cache_controller.storage_backend
-        getter = getattr(owner, "get_local_dfs_health_policy", None)
-        apply_policy = getattr(owner, "apply_dfs_health_policy", None)
-        if not callable(getter) or not callable(apply_policy):
-            return
-        local_policy = getter()
-        if local_policy is None:
-            return
-        effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
-        self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
-        apply_policy(*(bool(value) for value in effective.tolist()))
+        if not hasattr(self, "_dfs_policy_sync"):
+            self._dfs_policy_sync = DfsHealthPolicySync(self._reduce_dfs_health_policy)
+        self._dfs_policy_sync.poll(owner)
+
+    def _reduce_dfs_health_policy(self, policy: torch.Tensor) -> None:
+        self._all_reduce_attn_groups(policy, torch.distributed.ReduceOp.MIN)
+        if getattr(self, "pp_size", 1) > 1 and self.pp_group is not None:
+            torch.distributed.all_reduce(
+                policy, op=torch.distributed.ReduceOp.MIN, group=self.pp_group
+            )
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""

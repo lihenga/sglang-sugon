@@ -1,6 +1,7 @@
 """Exercise health capability negotiation and the Store/cache wiring on CPU."""
 
 import argparse
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -43,6 +44,15 @@ class NativeStore:
     def set_dfs_access_policy(self, read, write):
         self.policies.append((read, write))
         return 0
+
+
+def wait_for_policy(store, expected):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if store.policies[-1] == expected:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"Policy not applied: {store.policies}, expected {expected}")
 
 
 @pytest.mark.parametrize("declaration", [None, {}, {"features": {"dfs_health": True}}])
@@ -98,9 +108,11 @@ def test_health_options_are_registered_on_the_launch_cli():
     assert parsed.mooncake_dfs_health_probe_timeout_s == 7
 
 
-@pytest.mark.parametrize("tp_size,cp_size", [(1, 1), (2, 1), (1, 2)])
+@pytest.mark.parametrize(
+    "tp_size,cp_size,pp_size", [(1, 1, 1), (2, 1, 1), (1, 2, 1), (1, 1, 2)]
+)
 def test_store_fails_closed_before_warmup_and_defers_rank_policy(
-    monkeypatch, tp_size, cp_size
+    monkeypatch, tp_size, cp_size, pp_size
 ):
     monkeypatch.setenv(
         "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR", "distributed_storage_backend"
@@ -109,7 +121,7 @@ def test_store_fails_closed_before_warmup_and_defers_rank_policy(
         tp_rank=0,
         tp_size=tp_size,
         pp_rank=0,
-        pp_size=1,
+        pp_size=pp_size,
         attn_cp_rank=0,
         attn_cp_size=cp_size,
         is_mla_model=False,
@@ -138,14 +150,16 @@ def test_store_fails_closed_before_warmup_and_defers_rank_policy(
         store = MooncakeStore(config)
     manager = store._dfs_health_manager
     start.assert_called_once()
-    assert manager._defer_policy_application == (tp_size > 1 or cp_size > 1)
+    assert manager._defer_policy_application == (
+        tp_size > 1 or cp_size > 1 or pp_size > 1
+    )
     manager.probe_once()
     assert store.get_local_dfs_health_policy() == (True, True)
     assert store.store.policies[-1] == (
         (False, False) if manager._defer_policy_application else (True, True)
     )
     store.apply_dfs_health_policy(False, True)
-    assert store.store.policies[-1] == (False, True)
+    wait_for_policy(store.store, (False, True))
     store.close()
     assert manager._stop.is_set()
     assert store.get_local_dfs_health_policy() is None
@@ -235,7 +249,7 @@ def test_dfs_only_startup_does_not_write_before_health_opens(
         # A local success must still wait for the attention-rank verdict.
         assert store.store.policies == [(False, False)]
         store.apply_dfs_health_policy(True, True)
-        assert store.store.policies[-1] == (True, True)
+        wait_for_policy(store.store, (True, True))
     else:
         warmup.assert_called_once()
         assert store.store.policies == []
@@ -263,6 +277,8 @@ def test_cache_applies_attention_group_minimum(use_linker):
     def reduce(tensor, *, op, group):
         assert op == torch.distributed.ReduceOp.MIN
         groups.append(group)
+        if tensor.tolist() == [1, -1]:
+            return
         if group is cache.attn_cp_group:
             tensor[0] = 0
         else:
@@ -273,14 +289,94 @@ def test_cache_applies_attention_group_minimum(use_linker):
         patch.object(torch.distributed, "all_reduce", side_effect=reduce),
     ):
         cache._sync_dfs_health_policy()
-    assert groups == [cache.attn_cp_group, cache.attn_tp_group]
+    assert groups == [cache.attn_cp_group, cache.attn_tp_group] * 2
     assert applied == [(False, False)]
 
 
-def test_backends_without_health_do_not_add_collectives():
+def test_backends_without_health_only_check_capability_once():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.linker = None
     cache.cache_controller = SimpleNamespace(storage_backend=object())
     cache._all_reduce_attn_groups = Mock()
     cache._sync_dfs_health_policy()
+    cache._all_reduce_attn_groups.reset_mock()
+    cache._sync_dfs_health_policy()
     cache._all_reduce_attn_groups.assert_not_called()
+
+
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize(
+    "operation,code", [("write", -1606), ("read", -1607), ("read", -1608)]
+)
+def test_business_io_timeouts_report_health_but_admission_backpressure_does_not(
+    multi, operation, code
+):
+    store = MooncakeStore.__new__(MooncakeStore)
+    store._dfs_health_manager = Mock()
+    store._use_group_semantics = False
+    store.store = Mock()
+    store.store.batch_put_from.return_value = [code]
+    store.store.batch_put_from_multi_buffers.return_value = [code]
+    store.store.batch_get_into.return_value = [code]
+    store.store.batch_get_into_multi_buffers.return_value = [code]
+    store._replicate_config_cls = SimpleNamespace
+    buffers, sizes = ([[123]], [[4]]) if multi else ([123], [4])
+    method = (
+        store._put_batch_zero_copy_impl
+        if operation == "write"
+        else store._get_batch_zero_copy_impl
+    )
+    assert method(["key"], buffers, sizes) == [code]
+    report = store._dfs_health_manager.report_operation_timeout
+    if code == -1608:
+        report.assert_not_called()
+    else:
+        report.assert_called_once_with(operation, code)
+
+
+def test_controller_retains_backend_when_native_close_is_incomplete():
+    from sglang.srt.managers.cache_controller import HiCacheController
+
+    controller = HiCacheController.__new__(HiCacheController)
+    controller._stop_storage_threads = Mock()
+    controller._destroy_sync_groups = Mock()
+    owner = Mock()
+    owner.close.side_effect = RuntimeError("native work pending")
+    controller.storage_backend = owner
+    controller.enable_storage = True
+    controller.prefetch_hits_sync_groups = [object()]
+    controller.prefetch_completion_sync_groups = [object()]
+    controller.storage_stop_event = Mock()
+    with pytest.raises(RuntimeError, match="native work pending"):
+        controller.detach_storage_backend()
+    assert controller.storage_backend is owner
+    assert not controller.enable_storage
+    controller._destroy_sync_groups.assert_not_called()
+
+    owner.close.side_effect = None
+    controller.detach_storage_backend()
+    assert controller.storage_backend is None
+    assert not controller.enable_storage
+
+
+def test_failed_health_close_disables_cache_storage_admission():
+    from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
+
+    controller = SimpleNamespace(enable_storage=True)
+
+    def detach():
+        controller.enable_storage = False
+        raise RuntimeError("native work pending")
+
+    controller.detach_storage_backend = detach
+    cache = SimpleNamespace(
+        cache_controller=controller,
+        enable_storage=True,
+        enable_storage_metrics=True,
+        drain_storage_control_queues_local=Mock(),
+    )
+    ok, reason = StorageAttachment(cache).detach()
+    assert not ok
+    assert "native work pending" in reason
+    assert not cache.enable_storage
+    assert not cache.enable_storage_metrics

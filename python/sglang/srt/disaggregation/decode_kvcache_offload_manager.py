@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.srt.runtime_context import (
     get_memory,
+    get_parallel,
     get_schedule,
     get_serving,
 )
@@ -67,6 +68,9 @@ class DecodeKVCacheOffloadManager:
             )
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        parallel = get_parallel()
+        self.attn_cp_group = parallel.attn_cp_group.cpu_group
+        self.pp_group = parallel.pp_group.cpu_group
 
         hicache_storage_backend_extra_config = {}
         if get_memory().hicache_storage_backend_extra_config:
@@ -78,6 +82,20 @@ class DecodeKVCacheOffloadManager:
                 raise ValueError(
                     f"Invalid hicache storage backend extra config JSON: {e}"
                 )
+
+        if get_memory().hicache_storage_backend == "mooncake":
+            from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+                resolve_dfs_health_config,
+            )
+
+            hicache_storage_backend_extra_config["_mooncake_dfs_health_config"] = (
+                resolve_dfs_health_config(
+                    hicache_storage_backend_extra_config.get(
+                        "_mooncake_dfs_health_config"
+                    ),
+                    server_args=get_memory(),
+                )
+            )
 
         self.kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, UnifiedSWAKVPool):
@@ -97,6 +115,8 @@ class DecodeKVCacheOffloadManager:
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 page_size=self.page_size,
                 tp_cache_group=tp_group,
+                attn_cp_cache_group=self.attn_cp_group,
+                pp_cache_group=self.pp_group,
             )
             self.decode_host_mem_pool, self.cache_controller = build_hybrid_swa_stack(
                 params=params,
@@ -123,6 +143,8 @@ class DecodeKVCacheOffloadManager:
                 mem_pool_host=self.decode_host_mem_pool,
                 page_size=self.page_size,
                 tp_group=tp_group,
+                attn_cp_group=self.attn_cp_group,
+                pp_group=self.pp_group,
                 io_backend=get_memory().hicache_io_backend,
                 load_cache_event=threading.Event(),
                 storage_backend=get_memory().hicache_storage_backend,
@@ -139,6 +161,7 @@ class DecodeKVCacheOffloadManager:
         logger.info("Enable offload kv cache for decode side")
 
     def release_host_resources(self) -> None:
+        self.cache_controller.detach_storage_backend()
         self.decode_host_mem_pool.destroy()
 
     def _mark_offload_started(self, req: Req):
@@ -261,6 +284,8 @@ class DecodeKVCacheOffloadManager:
         """Check the progress of offload from device to host and backup from host to storage."""
         cc = self.cache_controller
 
+        self._sync_dfs_health_policy()
+
         qsizes = torch.tensor(
             [
                 len(cc.ack_write_queue),
@@ -276,6 +301,22 @@ class DecodeKVCacheOffloadManager:
         n_write, n_backup = map(int, qsizes.tolist())
         self._check_offload_progress(n_write)
         self._check_backup_progress(n_backup)
+
+    def _sync_dfs_health_policy(self) -> None:
+        from sglang.srt.mem_cache.storage.mooncake_store.dfs_policy import (
+            DfsHealthPolicySync,
+        )
+
+        if not hasattr(self, "_dfs_policy_sync"):
+            self._dfs_policy_sync = DfsHealthPolicySync(self._reduce_dfs_health_policy)
+        self._dfs_policy_sync.poll(self.cache_controller.storage_backend)
+
+    def _reduce_dfs_health_policy(self, policy: torch.Tensor) -> None:
+        for group in (self.tp_group, self.attn_cp_group, self.pp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.all_reduce(
+                    policy, op=torch.distributed.ReduceOp.MIN, group=group
+                )
 
     def drain_before_retraction(self):
         """Drain offloads, then refuse retraction on every rank if any rank still tracks a D2H copy."""

@@ -513,27 +513,45 @@ warning. The B300 L4 package already provides the required native APIs.
 
 DFS access starts disabled before storage warmup, so native memory-only fallback
 remains available while DFS health is unknown. Consecutive successes restore each
-capability; consecutive failures disable it. Attention CP/TP ranks apply the MIN
+capability; consecutive failures disable it. Attention CP/TP and PP ranks apply the MIN
 of their local policies during cache event polling. Timed-out probe results are
 discarded, even if they later succeed. Storage shutdown stops the probe loop.
 
 | CLI option | Environment fallback | Default |
 | --- | --- | --- |
-| `--mooncake-dfs-health-probe-interval-s` | `SGLANG_MOONCAKE_DFS_HEALTH_PROBE_INTERVAL_S` | 10 seconds |
-| `--mooncake-dfs-health-failure-threshold` | `SGLANG_MOONCAKE_DFS_HEALTH_FAILURE_THRESHOLD` | 3 |
-| `--mooncake-dfs-health-success-threshold` | `SGLANG_MOONCAKE_DFS_HEALTH_SUCCESS_THRESHOLD` | 3 |
-| `--mooncake-dfs-health-probe-timeout-s` | `SGLANG_MOONCAKE_DFS_HEALTH_PROBE_TIMEOUT_S` | 2 seconds |
+| `--mooncake-dfs-health-probe-interval-s` | `SGLANG_MOONCAKE_DFS_HEALTH_PROBE_INTERVAL_S` | 5 seconds |
+| `--mooncake-dfs-health-failure-threshold` | `SGLANG_MOONCAKE_DFS_HEALTH_FAILURE_THRESHOLD` | 2 |
+| `--mooncake-dfs-health-success-threshold` | `SGLANG_MOONCAKE_DFS_HEALTH_SUCCESS_THRESHOLD` | 2 |
+| `--mooncake-dfs-health-probe-timeout-s` | `SGLANG_MOONCAKE_DFS_HEALTH_PROBE_TIMEOUT_S` | 25 seconds |
 
 Values must be positive integers. Explicit health config takes precedence over
-CLI values, then environment variables, then defaults. DirectLinker and startup
-HiCache use the same resolver. A read failure does not by itself disable writes,
-and a write failure does not by itself disable reads.
+CLI values, then environment variables, then defaults. DirectLinker, startup and
+runtime HiCache attachment, and decode offload use the same resolver. Read and
+write probes have independent states, but effective DFS reads require both to be
+available. A write failure disables both access modes; a read failure leaves
+writes available.
+
+Real data-I/O timeouts (`-1606` for writes, `-1607` for reads) immediately mark the
+corresponding local capability unavailable. BatchGet admission backpressure
+(`-1608`) does not disable DFS. Recovery requires fresh successful probes; results
+from probes started before a data timeout cannot reopen access. Decode offload
+joins the same TP/CP/PP policy consensus. Capability mismatches are rejected
+collectively before ranks choose different policy-polling paths.
+
+In coordinated mode, one worker applies the latest native policy and retries
+failed updates at the probe interval. Scheduler polling never executes that
+native call. A pending update is not confirmation that native access stopped;
+the worker must receive a successful reply. Embedded B300 Client updates use
+local atomic stores. Standalone RPC builds must also release the GIL in the
+native policy binding to avoid blocking Python threads; API availability alone
+does not establish this property.
 
 The timeout bounds Python's wait, not the underlying native I/O. Each capability
 keeps at most one native probe in flight; if it remains stuck, that capability
-stays disabled until the call returns and a fresh probe succeeds. This port does
-not include replacement probes, PP-wide health consensus or native `timeout_ms`
-support from later changes.
+stays disabled until the call returns and fresh probes succeed. Shutdown stops
+new submissions and refuses detach/reattach while native work remains active.
+Retry close after operations drain, or restart the process if they remain stuck.
+This port does not cancel/replace native probes or add native `timeout_ms` support.
 For explicit DFS-only writes (`memory_replica_num=0, dfs_replica_num>0`), startup
 skips the storage data warmup because the initial policy leaves no writable
 replica. Probes validate DFS before the effective policy opens it. Requests may
