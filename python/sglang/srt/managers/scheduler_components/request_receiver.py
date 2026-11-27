@@ -70,6 +70,36 @@ class SchedulerRequestReceiver:
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
+    tp_cpu_group: Any = None
+    attn_cp_cpu_group: Any = None
+    attn_tp_cpu_group: Any = None
+    parallel: Any = None
+
+    def _parallel(self):
+        return self.parallel if self.parallel is not None else get_parallel()
+
+    def _cpu_group(self, name):
+        override = getattr(self, f"{name}_cpu_group")
+        return (
+            override
+            if override is not None
+            else getattr(self._parallel(), f"{name}_group").cpu_group
+        )
+
+    def _broadcast_attn_reqs(self, reqs):
+        if self.attn_cp_cpu_group is None and self.attn_tp_cpu_group is None:
+            return attn_cp_tp_broadcast_pyobj(reqs)
+        parallel = self._parallel()
+        cp, tp = parallel.attn_cp_group, parallel.attn_tp_group
+        if cp.world_size > 1 and tp.rank_in_group == 0:
+            reqs = broadcast_pyobj(
+                reqs, cp.rank, self.attn_cp_cpu_group, src=cp.ranks[0]
+            )
+        if tp.world_size > 1:
+            reqs = broadcast_pyobj(
+                reqs, tp.rank, self.attn_tp_cpu_group, src=tp.ranks[0]
+            )
+        return reqs
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -100,7 +130,7 @@ class SchedulerRequestReceiver:
 
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs, local_reqs)
 
-        if get_parallel().pp_rank == 0:
+        if self._parallel().pp_rank == 0:
             self.unwrap_pickle_wrapper(recv_reqs)
 
         recv_reqs = self._apply_mm_receiver(recv_reqs)
@@ -110,8 +140,9 @@ class SchedulerRequestReceiver:
         return recv_reqs
 
     def _pull_raw_reqs(self) -> Optional[List]:
-        if get_parallel().pp_rank == 0:
-            if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
+        parallel = self._parallel()
+        if parallel.pp_rank == 0:
+            if parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0:
                 recv_reqs = []
 
                 # Rust ringbuffer backend: drain the in-process ring fed by the
@@ -143,18 +174,18 @@ class SchedulerRequestReceiver:
             else:
                 recv_reqs = None
         else:
-            if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
+            if parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0:
                 dp_offset = (
-                    get_parallel().attn_dp_rank
-                    * get_parallel().attn_cp_size
-                    * get_parallel().attn_tp_size
+                    parallel.attn_dp_rank
+                    * parallel.attn_cp_size
+                    * parallel.attn_tp_size
                 )
                 recv_reqs = point_to_point_pyobj(
                     [],
-                    get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
-                    get_parallel().world_group.cpu_group,
-                    (get_parallel().pp_rank - 1) * get_parallel().tp_size + dp_offset,
-                    get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                    parallel.pp_rank * parallel.tp_size + dp_offset,
+                    parallel.world_group.cpu_group,
+                    (parallel.pp_rank - 1) * parallel.tp_size + dp_offset,
+                    parallel.pp_rank * parallel.tp_size + dp_offset,
                 )
             else:
                 recv_reqs = None
@@ -168,15 +199,16 @@ class SchedulerRequestReceiver:
         rank 0 and would overwrite every DP group's aborts but the first.
         """
         local_reqs = local_reqs or []
-        if get_parallel().attn_dp_enabled:
-            if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
+        parallel = self._parallel()
+        if parallel.attn_dp_enabled:
+            if parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
                 work_reqs.extend(local_reqs)
             else:
                 work_reqs = None
                 control_reqs = None
 
-            work_reqs = attn_cp_tp_broadcast_pyobj(work_reqs)
+            work_reqs = self._broadcast_attn_reqs(work_reqs)
 
             # When dp_attention_local_control_broadcast is enabled, each DP
             # group leader already receives control messages from the DP
@@ -184,29 +216,29 @@ class SchedulerRequestReceiver:
             # instead of the full tp_group.  This avoids an expensive
             # all-ranks gloo sync.
             _local_ctrl = (
-                get_parallel().enable_dp_attention_local_control_broadcast
+                parallel.enable_dp_attention_local_control_broadcast
                 or get_exec().moe.is_ep_scale_joiner
             )
             if _local_ctrl:
-                control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)
-            elif get_parallel().tp_size != 1:
-                tp_group = get_parallel().tp_group
+                control_reqs = self._broadcast_attn_reqs(control_reqs)
+            elif parallel.tp_size != 1:
+                tp_group = parallel.tp_group
                 control_reqs = broadcast_pyobj(
                     control_reqs,
                     tp_group.rank,
-                    tp_group.cpu_group,
+                    self._cpu_group("tp"),
                     src=tp_group.ranks[0],
                 )
             recv_reqs = work_reqs + control_reqs
         else:
             if recv_reqs is not None:
                 recv_reqs = [*recv_reqs, *local_reqs]
-            if get_parallel().tp_size != 1:
-                tp_group = get_parallel().tp_group
+            if parallel.tp_size != 1:
+                tp_group = parallel.tp_group
                 recv_reqs = broadcast_pyobj(
                     recv_reqs,
                     tp_group.rank,
-                    tp_group.cpu_group,
+                    self._cpu_group("tp"),
                     src=tp_group.ranks[0],
                 )
         return recv_reqs
@@ -227,7 +259,7 @@ class SchedulerRequestReceiver:
     def _apply_mm_receiver(self, recv_reqs: List) -> List:
         # Process MM requests under EPD-disaggregation mode
         if (
-            get_parallel().pp_rank == 0
+            self._parallel().pp_rank == 0
             and get_disagg().language_only
             and get_disagg().encoder_transfer_backend
             in ["zmq_to_scheduler", "mooncake"]
@@ -262,14 +294,14 @@ class SchedulerRequestReceiver:
             return
 
         # 1. wait until every rank has opened the shared feature segments
-        parallel = get_parallel()
+        parallel = self._parallel()
         if parallel.attn_dp_enabled:
             if parallel.attn_tp_size > 1:
-                barrier(group=parallel.attn_tp_group.cpu_group)
+                barrier(group=self._cpu_group("attn_tp"))
             if parallel.attn_cp_size > 1:
-                barrier(group=parallel.attn_cp_group.cpu_group)
+                barrier(group=self._cpu_group("attn_cp"))
         elif parallel.tp_size > 1:
-            barrier(group=parallel.tp_group.cpu_group)
+            barrier(group=self._cpu_group("tp"))
 
         # 2. materialize independently so one bad VLM request does not stop the loop
         failed = torch.zeros(len(tokenized_reqs), dtype=torch.int32)
@@ -289,15 +321,11 @@ class SchedulerRequestReceiver:
         # 3. all ranks reject the same requests before entering model collectives
         if parallel.attn_dp_enabled:
             if parallel.attn_tp_size > 1:
-                all_reduce(
-                    failed, op=ReduceOp.MAX, group=parallel.attn_tp_group.cpu_group
-                )
+                all_reduce(failed, op=ReduceOp.MAX, group=self._cpu_group("attn_tp"))
             if parallel.attn_cp_size > 1:
-                all_reduce(
-                    failed, op=ReduceOp.MAX, group=parallel.attn_cp_group.cpu_group
-                )
+                all_reduce(failed, op=ReduceOp.MAX, group=self._cpu_group("attn_cp"))
         elif parallel.tp_size > 1:
-            all_reduce(failed, op=ReduceOp.MAX, group=parallel.tp_group.cpu_group)
+            all_reduce(failed, op=ReduceOp.MAX, group=self._cpu_group("tp"))
 
         error = MMInputsProcessError(
             "Failed to materialize shared-memory multimodal features on a scheduler rank."

@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import contextvars
 import dataclasses
 import faulthandler
 import logging
@@ -23,9 +24,12 @@ import sys
 import time
 from array import array
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
+from queue import Empty, SimpleQueue
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.runtime_context import (
@@ -105,6 +109,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
+    create_custom_parallel_group,
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
@@ -717,6 +722,7 @@ class Scheduler(
         self.maybe_init_scripted_scheduler_hook()
 
         self.init_request_receiver()
+        self.init_forward_ingress()
 
         self.init_dp_attn_adapter()
 
@@ -1962,6 +1968,8 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        if self._forward_launch_executor is not None:
+            self._forward_launch_executor.shutdown(wait=True)
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -1992,7 +2000,9 @@ class Scheduler(
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         elif (is_cuda() or _is_hip) and (
-            self.enable_overlap or get_parallel().pp_size > 1
+            self.enable_overlap
+            or self._forward_ingress_enabled
+            or get_parallel().pp_size > 1
         ):
             # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
             # stream aliases forward_stream, which would eliminate scheduler
@@ -2483,6 +2493,202 @@ class Scheduler(
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
+
+    def init_forward_ingress(self) -> None:
+        linker = getattr(self.tree_cache, "linker", None)
+        prefetch = bool(
+            envs.SGLANG_MOONCAKE_FORWARD_INGRESS.get()
+            and linker is not None
+            and getattr(linker.cache_linker, "prefetch_enabled", False)
+            and get_memory().unified_cache_external_linker_backend == "mooncake"
+            and self.is_generation
+            and get_parallel().pp_size == 1
+            and self.disaggregation_mode
+            in (DisaggregationMode.NULL, DisaggregationMode.PREFILL)
+        )
+        enabled = bool(
+            prefetch
+            and not self.enable_pdmux
+            and (self.spec_algorithm.is_none() or self.spec_algorithm.is_dspark())
+            and self.schedule_policy == "fcfs"
+            and get_observability().kv_canary == "none"
+            and self.device in ("cuda", "cpu")
+            and self.mm_receiver is None
+            and self.input_blocker is None
+            and self.scripted_scheduler_hook is None
+        )
+        # Group creation is world-collective, including ranks that cannot enable it.
+        world = get_parallel().world_group
+        flags = torch.tensor([int(prefetch), int(enabled)], dtype=torch.int)
+        if world.world_size > 1:
+            torch.distributed.all_reduce(
+                flags, op=torch.distributed.ReduceOp.MIN, group=world.cpu_group
+            )
+        self._waiting_queue_prefetch_enabled = bool(flags[0].item())
+        self._forward_ingress_enabled = bool(flags[1].item())
+        self._forward_launch_executor = None
+        self._forward_ingress_group = None
+        if not self._forward_ingress_enabled:
+            return
+
+        groups = []
+        for original in (
+            self.tp_cpu_group,
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        ):
+            groups.append(
+                create_custom_parallel_group(
+                    torch.distributed.get_process_group_ranks(original), backend="gloo"
+                )
+            )
+        tp, cp, attn_tp = groups
+        self._forward_ingress_group = tp
+        # DSPARK's draft scopes temporarily narrow the process-global topology.
+        # Socket ownership and receive broadcasts must keep the target topology.
+        parallel = get_parallel()
+        receive_parallel = SimpleNamespace(
+            **{
+                name: getattr(parallel, name)
+                for name in (
+                    "pp_rank",
+                    "tp_size",
+                    "tp_group",
+                    "world_group",
+                    "attn_dp_enabled",
+                    "attn_tp_rank",
+                    "attn_cp_rank",
+                    "attn_dp_rank",
+                    "attn_cp_size",
+                    "attn_tp_size",
+                    "attn_cp_group",
+                    "attn_tp_group",
+                    "enable_dp_attention_local_control_broadcast",
+                )
+            }
+        )
+        self.request_receiver = dataclasses.replace(
+            self.request_receiver,
+            tp_cpu_group=tp,
+            attn_cp_cpu_group=cp,
+            attn_tp_cpu_group=attn_tp,
+            parallel=receive_parallel,
+        )
+        # Forward keeps the model's CPU groups; lookup uses its own communicators.
+        self.tree_cache.attn_cp_group = cp
+        self.tree_cache.attn_tp_group = attn_tp
+        self.tree_cache.tp_group = tp
+        self._forward_launch_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mooncake-forward"
+        )
+        logger.info("Mooncake forward-time request ingress enabled")
+
+    def _forward_with_waiting_queue_ingress(self, batch, **kwargs):
+        if not self._forward_ingress_enabled:
+            return self.model_worker.forward_batch_generation(batch, **kwargs)
+
+        # Freeze the producer fence before ingress can enqueue more scheduler work.
+        ready = self.device_module.Event()
+        ready.record(self.schedule_stream)
+        callbacks = SimpleQueue()
+
+        def grammar_barrier():
+            # DSPARK may advance pending grammar mid-forward. Requests and
+            # result-queue state remain owned by the scheduler thread.
+            done = Future()
+            callbacks.put(done)
+            return done.result()
+
+        forward_kwargs = dict(kwargs)
+        if kwargs.get("grammar_barrier") is not None:
+            forward_kwargs["grammar_barrier"] = grammar_barrier
+
+        def launch():
+            if self.device != "cpu":
+                self.device_module.set_device(self.tp_worker.gpu_id)
+            with (
+                DynamicGradMode(),
+                self.device_module.StreamContext(self.forward_stream),
+            ):
+                self.forward_stream.wait_event(ready)
+                return self.model_worker.forward_batch_generation(
+                    batch, **forward_kwargs
+                )
+
+        future = self._forward_launch_executor.submit(
+            contextvars.copy_context().run, launch
+        )
+
+        def eligible(req):
+            return (
+                isinstance(req, TokenizedGenerateReqInput)
+                and not is_health_check_generate_req(req)
+                and all(
+                    getattr(req, name, None) is None
+                    for name in (
+                        "mm_inputs",
+                        "input_embeds",
+                        "session_id",
+                        "session_params",
+                        "lora_id",
+                        "positional_embed_overrides",
+                    )
+                )
+                and all(
+                    getattr(req.sampling_params, name, None) is None
+                    for name in ("json_schema", "regex", "ebnf", "structural_tag")
+                )
+                and BeamCoordinator.request_beam_width(req) == 1
+            )
+
+        while True:
+            try:
+                callback = callbacks.get_nowait()
+            except Empty:
+                pass
+            else:
+                try:
+                    with self.device_module.StreamContext(self.forward_stream):
+                        callback.set_result(kwargs["grammar_barrier"]())
+                except BaseException as error:
+                    callback.set_exception(error)
+                    raise
+            if future.done() and future.exception() is not None:
+                future.result()
+            # Even a rank whose forward finished must join all receive broadcasts.
+            active = torch.tensor([int(not future.done())], dtype=torch.int)
+            torch.distributed.all_reduce(
+                active,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self._forward_ingress_group,
+            )
+            if not active.item():
+                break
+            with self.device_module.StreamContext(self.schedule_stream):
+                recv_reqs = self.request_receiver.recv_requests()
+                for req in recv_reqs:
+                    if self._deferred_input_requests:
+                        self._deferred_input_requests.append(req)
+                    elif is_health_check_generate_req(req) and not self.attn_dp_enabled:
+                        self.return_health_check_ipcs.append(
+                            getattr(req, "http_worker_ipc", None)
+                        )
+                    elif eligible(req):
+                        self.handle_generate_request(req)
+                    elif isinstance(req, BatchTokenizedGenerateReqInput) and all(
+                        eligible(sub_req) for sub_req in req
+                    ):
+                        self.handle_batch_generate_request(req)
+                    else:
+                        # Control and unsupported requests replay at the next boundary.
+                        self._deferred_input_requests.append(req)
+            if not recv_reqs:
+                time.sleep(0.01)
+
+        result = future.result()
+        if not self.enable_overlap:
+            self.schedule_stream.wait_stream(self.forward_stream)
+        return result
 
     def init_dp_attn_adapter(self) -> None:
         # Spec workers have no .model_runner of their own; the prefill graph
@@ -3340,6 +3546,14 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
+        if getattr(self, "_waiting_queue_prefetch_enabled", False):
+            # Session matching can lend/free active KV; rejected requests must
+            # not abort another turn's in-flight session during this early probe.
+            if req.session is not None or req.to_finish is not None:
+                return
+            # Matching submits native session prefetch without allocating device KV.
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            return
         if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
@@ -4655,6 +4869,11 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
+            forward_batch_generation = (
+                self._forward_with_waiting_queue_ingress
+                if self._forward_ingress_enabled
+                else self.model_worker.forward_batch_generation
+            )
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
@@ -4701,9 +4920,7 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
-                        )
+                        batch_result = forward_batch_generation(batch, **fwd_kwargs)
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -4826,7 +5043,7 @@ class Scheduler(
                     # future_map relay / on_publish).
                     resolve_forward_inputs(batch, self.future_map)
                     with self._forward_isolation(batch, overlap=False):
-                        batch_result = self.model_worker.forward_batch_generation(
+                        batch_result = forward_batch_generation(
                             batch, pp_proxy_tensors=pp_proxy_tensors
                         )
                     # The isolation restore reverted the worker's in-forward SB edits;
@@ -4867,9 +5084,7 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
-                )
+                batch_result = forward_batch_generation(batch, **kwargs)
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(

@@ -43,6 +43,46 @@ ranks 0 and 1 write two shards per page; ranks 2 and 3 read those same objects.
 Use matching model settings. KV format and host layout are not yet in the keys;
 use different `extra_backend_tag` values when these differ.
 
+### Request ingress during forward (direct linker)
+
+With `SGLANG_MOONCAKE_FORWARD_INGRESS=1` and
+`--mooncake-enable-waiting-queue-dfs-prefetch`, ordinary generation requests
+entering the waiting queue (or PD prefill bootstrap queue) probe the prefix and
+submit native session prefetch when a hit and available prefetch quota permit.
+This early lookup requires PP=1, normal serving or PD prefill, and agreement
+across all ranks. Session and pre-aborted requests skip the early lookup. For supported
+configurations, the scheduler also receives ordinary text generation
+requests while the current model forward runs on a dedicated thread. Device KV
+allocation and request admission still happen at the normal scheduling boundary.
+
+`SGLANG_MOONCAKE_FORWARD_INGRESS` defaults to `1`. Set it before server startup
+to A/B the entire scheduler migration:
+
+```bash
+export SGLANG_MOONCAKE_FORWARD_INGRESS=0  # 1 to enable
+```
+
+`0` disables both the new queue-entry prefix lookup/prefetch and forward-time
+reception. Generation uses the original model-worker call on the scheduler
+thread, with no ingress executor, extra process groups, polling, or stream
+fences. Existing lookup-triggered session prefetch at normal scheduling remains
+controlled by its original CLI option. The only added synchronization in this
+mode is one startup agreement across ranks, so mismatched switches cannot
+deadlock group creation. Metrics added separately are independent of this switch.
+
+Forward-time reception supports both overlap and non-overlap scheduling, including
+DSPARK with overlap enabled (for example TP8/DCP8 Kimi-K3). It requires the
+Mooncake direct linker, native session prefetch, FCFS, PP=1, and normal serving
+or PD prefill on CUDA or CPU. It is disabled with speculative algorithms other
+than DSPARK, PD multiplexing, KV
+canary, encoder receivers, colocated input blocking, or scripted runtime hooks.
+All ranks agree on the switch at startup; an ineligible rank disables it for
+the whole instance. Control, multimodal, session, LoRA, beam, embedding-override,
+and constrained-generation requests replay in order after forward completes.
+DSPARK publication stays on the model thread; its grammar barrier runs on the
+scheduler thread. Overlap retains its existing result queue, sampling, and WAR
+barrier without adding a whole-forward GPU wait to the scheduler stream.
+
 ## Install Mooncake
 
 **Method 1: with pip**
